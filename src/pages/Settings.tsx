@@ -1,9 +1,15 @@
-import { useState } from 'react';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import {
   Table,
   TableBody,
@@ -11,13 +17,13 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from '@/components/ui/table';
+} from "@/components/ui/table";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
-} from '@/components/ui/dialog';
+} from "@/components/ui/dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -27,26 +33,28 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
-import { AppHeader } from '@/components/AppHeader';
-import { useEmailRecipients } from '@/hooks/useEmailRecipients';
-import { EmailRecipient } from '@/lib/db';
-import { Plus, Pencil, Trash2, Mail, Bell, Clock } from 'lucide-react';
-import { toast } from 'sonner';
+} from "@/components/ui/alert-dialog";
+import { AppHeader } from "@/components/AppHeader";
+import { useEmailRecipients } from "@/hooks/useEmailRecipients";
+import { EmailRecipient } from "@/lib/db";
+import { Plus, Pencil, Trash2, Mail, Bell, Clock } from "lucide-react";
+import { toast } from "sonner";
 
 const Settings = () => {
   const { recipients, loading, add, update, remove } = useEmailRecipients();
   const [addModalOpen, setAddModalOpen] = useState(false);
-  const [editRecipient, setEditRecipient] = useState<EmailRecipient | null>(null);
+  const [editRecipient, setEditRecipient] = useState<EmailRecipient | null>(
+    null
+  );
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
   const handleDelete = async () => {
     if (!deleteId) return;
     try {
       await remove(deleteId);
-      toast.success('Recipient deleted');
+      toast.success("Recipient deleted");
     } catch {
-      toast.error('Failed to delete recipient');
+      toast.error("Failed to delete recipient");
     } finally {
       setDeleteId(null);
     }
@@ -55,9 +63,11 @@ const Settings = () => {
   const handleToggleActive = async (recipient: EmailRecipient) => {
     try {
       await update(recipient.id, { isActive: !recipient.isActive });
-      toast.success(recipient.isActive ? 'Recipient deactivated' : 'Recipient activated');
+      toast.success(
+        recipient.isActive ? "Recipient deactivated" : "Recipient activated"
+      );
     } catch {
-      toast.error('Failed to update recipient');
+      toast.error("Failed to update recipient");
     }
   };
 
@@ -67,9 +77,12 @@ const Settings = () => {
 
       <main className="container mx-auto px-4 py-8">
         <div className="mb-8">
-          <h1 className="font-display text-3xl font-bold mb-2">Email Settings</h1>
+          <h1 className="font-display text-3xl font-bold mb-2">
+            Email Settings
+          </h1>
           <p className="text-muted-foreground">
-            Configure email recipients and notification preferences for certification expiry alerts.
+            Configure email recipients and notification preferences for
+            certification expiry alerts.
           </p>
         </div>
 
@@ -81,13 +94,21 @@ const Settings = () => {
               Notification Schedule
             </CardTitle>
             <CardDescription>
-              Automatic email reminders are sent at these intervals before certification expiry:
+              Automatic email reminders are sent at these intervals before
+              certification expiry:
             </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="flex flex-wrap gap-3">
-              {['6 months', '3 months', '1 month', '2 weeks', '1 week', '1 day'].map((interval) => (
-                <div 
+              {[
+                "6 months",
+                "3 months",
+                "1 month",
+                "2 weeks",
+                "1 week",
+                "1 day",
+              ].map((interval) => (
+                <div
                   key={interval}
                   className="flex items-center gap-2 px-3 py-2 rounded-lg bg-background border"
                 >
@@ -97,7 +118,9 @@ const Settings = () => {
               ))}
               <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-destructive/10 border border-destructive/20">
                 <Mail className="h-4 w-4 text-destructive" />
-                <span className="text-sm font-medium text-destructive">Daily after expiry</span>
+                <span className="text-sm font-medium text-destructive">
+                  Daily after expiry
+                </span>
               </div>
             </div>
           </CardContent>
@@ -126,7 +149,10 @@ const Settings = () => {
               <div className="text-center py-12 text-muted-foreground">
                 <Mail className="h-12 w-12 mx-auto mb-4 opacity-30" />
                 <p>No recipients added yet.</p>
-                <p className="text-sm">Add email recipients to receive certification expiry notifications.</p>
+                <p className="text-sm">
+                  Add email recipients to receive certification expiry
+                  notifications.
+                </p>
               </div>
             ) : (
               <Table>
@@ -141,14 +167,18 @@ const Settings = () => {
                 </TableHeader>
                 <TableBody>
                   {recipients.map((recipient, index) => (
-                    <TableRow 
+                    <TableRow
                       key={recipient.id}
                       className="animate-fade-in"
                       style={{ animationDelay: `${index * 50}ms` }}
                     >
-                      <TableCell className="font-medium">{recipient.name}</TableCell>
+                      <TableCell className="font-medium">
+                        {recipient.name}
+                      </TableCell>
                       <TableCell>{recipient.email}</TableCell>
-                      <TableCell className="text-muted-foreground">{recipient.role}</TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {recipient.role}
+                      </TableCell>
                       <TableCell>
                         <Switch
                           checked={recipient.isActive}
@@ -197,10 +227,10 @@ const Settings = () => {
         onSave={async (data) => {
           if (editRecipient) {
             await update(editRecipient.id, data);
-            toast.success('Recipient updated');
+            toast.success("Recipient updated");
           } else {
             await add({ ...data, isActive: true });
-            toast.success('Recipient added');
+            toast.success("Recipient added");
           }
           setAddModalOpen(false);
           setEditRecipient(null);
@@ -213,12 +243,13 @@ const Settings = () => {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete Recipient</AlertDialogTitle>
             <AlertDialogDescription>
-              This will remove this recipient from receiving all certification notifications.
+              This will remove this recipient from receiving all certification
+              notifications.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction 
+            <AlertDialogAction
               onClick={handleDelete}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
@@ -235,36 +266,45 @@ interface RecipientModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   recipient: EmailRecipient | null;
-  onSave: (data: { name: string; email: string; role: string }) => Promise<void>;
+  onSave: (data: {
+    name: string;
+    email: string;
+    role: string;
+  }) => Promise<void>;
 }
 
-const RecipientModal = ({ open, onOpenChange, recipient, onSave }: RecipientModalProps) => {
+const RecipientModal = ({
+  open,
+  onOpenChange,
+  recipient,
+  onSave,
+}: RecipientModalProps) => {
   const [loading, setLoading] = useState(false);
   const [formData, setFormData] = useState({
-    name: recipient?.name || '',
-    email: recipient?.email || '',
-    role: recipient?.role || '',
+    name: recipient?.name || "",
+    email: recipient?.email || "",
+    role: recipient?.role || "",
   });
 
   // Reset form when modal opens with different recipient
-  useState(() => {
+  useEffect(() => {
     setFormData({
-      name: recipient?.name || '',
-      email: recipient?.email || '',
-      role: recipient?.role || '',
+      name: recipient?.name || "",
+      email: recipient?.email || "",
+      role: recipient?.role || "",
     });
-  });
+  }, [recipient, open]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name || !formData.email) {
-      toast.error('Please fill in required fields');
+      toast.error("Please fill in required fields");
       return;
     }
     setLoading(true);
     try {
       await onSave(formData);
-      setFormData({ name: '', email: '', role: '' });
+      setFormData({ name: "", email: "", role: "" });
     } finally {
       setLoading(false);
     }
@@ -275,7 +315,7 @@ const RecipientModal = ({ open, onOpenChange, recipient, onSave }: RecipientModa
       <DialogContent>
         <DialogHeader>
           <DialogTitle className="font-display">
-            {recipient ? 'Edit Recipient' : 'Add Recipient'}
+            {recipient ? "Edit Recipient" : "Add Recipient"}
           </DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
@@ -284,7 +324,9 @@ const RecipientModal = ({ open, onOpenChange, recipient, onSave }: RecipientModa
             <Input
               id="name"
               value={formData.name}
-              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, name: e.target.value })
+              }
               placeholder="John Doe"
               required
             />
@@ -295,7 +337,9 @@ const RecipientModal = ({ open, onOpenChange, recipient, onSave }: RecipientModa
               id="email"
               type="email"
               value={formData.email}
-              onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, email: e.target.value })
+              }
               placeholder="john@example.com"
               required
             />
@@ -305,16 +349,22 @@ const RecipientModal = ({ open, onOpenChange, recipient, onSave }: RecipientModa
             <Input
               id="role"
               value={formData.role}
-              onChange={(e) => setFormData({ ...formData, role: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, role: e.target.value })
+              }
               placeholder="e.g., Compliance Manager"
             />
           </div>
           <div className="flex justify-end gap-3 pt-4">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
               Cancel
             </Button>
             <Button type="submit" variant="hero" disabled={loading}>
-              {loading ? 'Saving...' : recipient ? 'Update' : 'Add'}
+              {loading ? "Saving..." : recipient ? "Update" : "Add"}
             </Button>
           </div>
         </form>
