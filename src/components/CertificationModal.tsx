@@ -16,6 +16,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
+
 import {
   Certification,
   CertificationAttachmentPayload,
@@ -47,21 +49,21 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-function filenameFromDisposition(disposition: string | null): string | null {
-  if (!disposition) return null;
-  // Content-Disposition: attachment; filename="abc.pdf"
-  const m =
-    /filename\*=UTF-8''([^;]+)|filename="([^"]+)"|filename=([^;]+)/i.exec(
-      disposition
-    );
-  const raw = (m?.[1] || m?.[2] || m?.[3] || "").trim();
-  if (!raw) return null;
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
+function parseTypeFlags(t: string | undefined) {
+  const s = String(t || "").toUpperCase();
+  return {
+    bis: s.includes("BIS"),
+    iec: s.includes("IEC"),
+  };
 }
+
+function flagsToType(bis: boolean, iec: boolean): "BIS" | "IEC" | "BIS & IEC" {
+  if (bis && iec) return "BIS & IEC";
+  if (iec) return "IEC";
+  return "BIS";
+}
+
+type StatusValue = "Active" | "Under process" | "Expired" | "Pending";
 
 export const CertificationModal = ({
   open,
@@ -77,16 +79,29 @@ export const CertificationModal = ({
       sno: certification?.sno ?? nextSno,
       plant: certification?.plant ?? "",
       address: certification?.address ?? "",
-      rNo: certification?.rNo ?? "",
-      type: (certification?.type ?? "BIS") as "BIS" | "IEC",
-      status: (certification?.status ?? "Pending") as Certification["status"],
-      modelList: certification?.modelList ?? "",
-      standard: certification?.standard ?? "",
-      validityFrom: certification?.validityFrom ?? "",
-      validityUpto: certification?.validityUpto ?? "",
-      renewalStatus: certification?.renewalStatus ?? "",
-      alarmAlert: certification?.alarmAlert ?? "",
-      action: certification?.action ?? "",
+      type: (certification?.type ?? "BIS") as "BIS" | "IEC" | "BIS & IEC",
+
+      // BIS
+      bisRNo: certification?.bisRNo ?? "",
+      bisStatus: (certification?.bisStatus ?? "Pending") as StatusValue,
+      bisModelList: certification?.bisModelList ?? "",
+      bisStandard: certification?.bisStandard ?? "",
+      bisValidityFrom: certification?.bisValidityFrom ?? "",
+      bisValidityUpto: certification?.bisValidityUpto ?? "",
+      bisRenewalStatus: certification?.bisRenewalStatus ?? "",
+      bisAlarmAlert: certification?.bisAlarmAlert ?? "",
+      bisAction: certification?.bisAction ?? "",
+
+      // IEC
+      iecRNo: certification?.iecRNo ?? "",
+      iecStatus: (certification?.iecStatus ?? "Pending") as StatusValue,
+      iecModelList: certification?.iecModelList ?? "",
+      iecStandard: certification?.iecStandard ?? "",
+      iecValidityFrom: certification?.iecValidityFrom ?? "",
+      iecValidityUpto: certification?.iecValidityUpto ?? "",
+      iecRenewalStatus: certification?.iecRenewalStatus ?? "",
+      iecAlarmAlert: certification?.iecAlarmAlert ?? "",
+      iecAction: certification?.iecAction ?? "",
     };
   }, [certification, nextSno]);
 
@@ -97,14 +112,13 @@ export const CertificationModal = ({
     useState<CertificationAttachmentPayload | null>(null);
   const [attachmentClear, setAttachmentClear] = useState(false);
 
-  // ✅ CRITICAL FIX: when you click Edit on another row, props change but state won’t unless we sync.
+  // ✅ when modal opens or row changes, sync state to props
   useEffect(() => {
     if (!open) return;
     setFormData(initialForm);
     setAttachment(null);
     setAttachmentClear(false);
   }, [open, initialForm]);
-  
 
   const hasExistingAttachment = Boolean(
     certification?.hasAttachment && certification?.attachmentName
@@ -148,8 +162,18 @@ export const CertificationModal = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!formData.plant || !formData.rNo) {
+    const flags = parseTypeFlags(formData.type);
+
+    if (!String(formData.plant || "").trim()) {
       toast.error("Please fill in required fields");
+      return;
+    }
+    if (flags.bis && !String(formData.bisRNo || "").trim()) {
+      toast.error("Please enter BIS R-No / ID");
+      return;
+    }
+    if (flags.iec && !String(formData.iecRNo || "").trim()) {
+      toast.error("Please enter IEC R-No / ID");
       return;
     }
 
@@ -181,6 +205,492 @@ export const CertificationModal = ({
 
   const onUndoRemoveAttachment = () => {
     setAttachmentClear(false);
+  };
+
+  const StatusSelect = ({
+    value,
+    onChange,
+  }: {
+    value: StatusValue;
+    onChange: (v: StatusValue) => void;
+  }) => {
+    return (
+      <Select value={value} onValueChange={(v) => onChange(v as StatusValue)}>
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="Active">Active</SelectItem>
+          <SelectItem value="Under process">Under Process</SelectItem>
+          <SelectItem value="Expired">Expired</SelectItem>
+          <SelectItem value="Pending">Pending</SelectItem>
+        </SelectContent>
+      </Select>
+    );
+  };
+
+  const flags = parseTypeFlags(formData.type);
+
+  const renderModelList = () => {
+    if (flags.bis && flags.iec) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="bisModelList">BIS Model List</Label>
+            <Textarea
+              id="bisModelList"
+              value={formData.bisModelList}
+              onChange={(e) =>
+                setFormData({ ...formData, bisModelList: e.target.value })
+              }
+              placeholder="List of BIS models..."
+              rows={3}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="iecModelList">IEC Model List</Label>
+            <Textarea
+              id="iecModelList"
+              value={formData.iecModelList}
+              onChange={(e) =>
+                setFormData({ ...formData, iecModelList: e.target.value })
+              }
+              placeholder="List of IEC models..."
+              rows={3}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    if (flags.bis) {
+      return (
+        <div className="space-y-2">
+          <Label htmlFor="bisModelList">BIS Model List</Label>
+          <Textarea
+            id="bisModelList"
+            value={formData.bisModelList}
+            onChange={(e) =>
+              setFormData({ ...formData, bisModelList: e.target.value })
+            }
+            placeholder="List of BIS models..."
+            rows={3}
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-2">
+        <Label htmlFor="iecModelList">IEC Model List</Label>
+        <Textarea
+          id="iecModelList"
+          value={formData.iecModelList}
+          onChange={(e) =>
+            setFormData({ ...formData, iecModelList: e.target.value })
+          }
+          placeholder="List of IEC models..."
+          rows={3}
+        />
+      </div>
+    );
+  };
+
+  const renderStandard = () => {
+    if (flags.bis && flags.iec) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="bisStandard">BIS Standard</Label>
+            <Textarea
+              id="bisStandard"
+              value={formData.bisStandard}
+              onChange={(e) =>
+                setFormData({ ...formData, bisStandard: e.target.value })
+              }
+              placeholder="Applicable BIS standards..."
+              rows={2}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="iecStandard">IEC Standard</Label>
+            <Textarea
+              id="iecStandard"
+              value={formData.iecStandard}
+              onChange={(e) =>
+                setFormData({ ...formData, iecStandard: e.target.value })
+              }
+              placeholder="Applicable IEC standards..."
+              rows={2}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    if (flags.bis) {
+      return (
+        <div className="space-y-2">
+          <Label htmlFor="bisStandard">BIS Standard</Label>
+          <Textarea
+            id="bisStandard"
+            value={formData.bisStandard}
+            onChange={(e) =>
+              setFormData({ ...formData, bisStandard: e.target.value })
+            }
+            placeholder="Applicable BIS standards..."
+            rows={2}
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-2">
+        <Label htmlFor="iecStandard">IEC Standard</Label>
+        <Textarea
+          id="iecStandard"
+          value={formData.iecStandard}
+          onChange={(e) =>
+            setFormData({ ...formData, iecStandard: e.target.value })
+          }
+          placeholder="Applicable IEC standards..."
+          rows={2}
+        />
+      </div>
+    );
+  };
+
+  const renderValidity = () => {
+    if (flags.bis && flags.iec) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="rounded-lg border p-3 space-y-3">
+            <div className="text-sm font-medium">BIS Validity</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label htmlFor="bisValidityFrom">From</Label>
+                <Input
+                  id="bisValidityFrom"
+                  type="date"
+                  value={formData.bisValidityFrom}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      bisValidityFrom: e.target.value,
+                    })
+                  }
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="bisValidityUpto">Upto</Label>
+                <Input
+                  id="bisValidityUpto"
+                  type="date"
+                  value={formData.bisValidityUpto}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      bisValidityUpto: e.target.value,
+                    })
+                  }
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border p-3 space-y-3">
+            <div className="text-sm font-medium">IEC Validity</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label htmlFor="iecValidityFrom">From</Label>
+                <Input
+                  id="iecValidityFrom"
+                  type="date"
+                  value={formData.iecValidityFrom}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      iecValidityFrom: e.target.value,
+                    })
+                  }
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="iecValidityUpto">Upto</Label>
+                <Input
+                  id="iecValidityUpto"
+                  type="date"
+                  value={formData.iecValidityUpto}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      iecValidityUpto: e.target.value,
+                    })
+                  }
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (flags.bis) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="bisValidityFrom">BIS Validity From</Label>
+            <Input
+              id="bisValidityFrom"
+              type="date"
+              value={formData.bisValidityFrom}
+              onChange={(e) =>
+                setFormData({ ...formData, bisValidityFrom: e.target.value })
+              }
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="bisValidityUpto">BIS Validity Upto</Label>
+            <Input
+              id="bisValidityUpto"
+              type="date"
+              value={formData.bisValidityUpto}
+              onChange={(e) =>
+                setFormData({ ...formData, bisValidityUpto: e.target.value })
+              }
+            />
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="iecValidityFrom">IEC Validity From</Label>
+          <Input
+            id="iecValidityFrom"
+            type="date"
+            value={formData.iecValidityFrom}
+            onChange={(e) =>
+              setFormData({ ...formData, iecValidityFrom: e.target.value })
+            }
+          />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="iecValidityUpto">IEC Validity Upto</Label>
+          <Input
+            id="iecValidityUpto"
+            type="date"
+            value={formData.iecValidityUpto}
+            onChange={(e) =>
+              setFormData({ ...formData, iecValidityUpto: e.target.value })
+            }
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const renderRenewalAndAlarm = () => {
+    if (flags.bis && flags.iec) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="rounded-lg border p-3 space-y-3">
+            <div className="text-sm font-medium">BIS Renewal / Alarm</div>
+            <div className="space-y-2">
+              <Label htmlFor="bisRenewalStatus">Renewal Status</Label>
+              <Input
+                id="bisRenewalStatus"
+                value={formData.bisRenewalStatus}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    bisRenewalStatus: e.target.value,
+                  })
+                }
+                placeholder="e.g., Renewal initiated / date / remarks"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="bisAlarmAlert">Alarm Alert</Label>
+              <Input
+                id="bisAlarmAlert"
+                value={formData.bisAlarmAlert}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    bisAlarmAlert: e.target.value,
+                  })
+                }
+                placeholder="e.g., - / Alert configured / rule"
+              />
+            </div>
+          </div>
+
+          <div className="rounded-lg border p-3 space-y-3">
+            <div className="text-sm font-medium">IEC Renewal / Alarm</div>
+            <div className="space-y-2">
+              <Label htmlFor="iecRenewalStatus">Renewal Status</Label>
+              <Input
+                id="iecRenewalStatus"
+                value={formData.iecRenewalStatus}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    iecRenewalStatus: e.target.value,
+                  })
+                }
+                placeholder="e.g., Renewal initiated / date / remarks"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="iecAlarmAlert">Alarm Alert</Label>
+              <Input
+                id="iecAlarmAlert"
+                value={formData.iecAlarmAlert}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    iecAlarmAlert: e.target.value,
+                  })
+                }
+                placeholder="e.g., - / Alert configured / rule"
+              />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (flags.bis) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="bisRenewalStatus">BIS Renewal Status</Label>
+            <Input
+              id="bisRenewalStatus"
+              value={formData.bisRenewalStatus}
+              onChange={(e) =>
+                setFormData({ ...formData, bisRenewalStatus: e.target.value })
+              }
+              placeholder="e.g., Renewal initiated / date / remarks"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="bisAlarmAlert">BIS Alarm Alert</Label>
+            <Input
+              id="bisAlarmAlert"
+              value={formData.bisAlarmAlert}
+              onChange={(e) =>
+                setFormData({ ...formData, bisAlarmAlert: e.target.value })
+              }
+              placeholder="e.g., - / Alert configured / rule"
+            />
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="iecRenewalStatus">IEC Renewal Status</Label>
+          <Input
+            id="iecRenewalStatus"
+            value={formData.iecRenewalStatus}
+            onChange={(e) =>
+              setFormData({ ...formData, iecRenewalStatus: e.target.value })
+            }
+            placeholder="e.g., Renewal initiated / date / remarks"
+          />
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="iecAlarmAlert">IEC Alarm Alert</Label>
+          <Input
+            id="iecAlarmAlert"
+            value={formData.iecAlarmAlert}
+            onChange={(e) =>
+              setFormData({ ...formData, iecAlarmAlert: e.target.value })
+            }
+            placeholder="e.g., - / Alert configured / rule"
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const renderAction = () => {
+    if (flags.bis && flags.iec) {
+      return (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="bisAction">BIS Action / Notes</Label>
+            <Textarea
+              id="bisAction"
+              value={formData.bisAction}
+              onChange={(e) =>
+                setFormData({ ...formData, bisAction: e.target.value })
+              }
+              placeholder="Any BIS action items or notes..."
+              rows={2}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="iecAction">IEC Action / Notes</Label>
+            <Textarea
+              id="iecAction"
+              value={formData.iecAction}
+              onChange={(e) =>
+                setFormData({ ...formData, iecAction: e.target.value })
+              }
+              placeholder="Any IEC action items or notes..."
+              rows={2}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    if (flags.bis) {
+      return (
+        <div className="space-y-2">
+          <Label htmlFor="bisAction">BIS Action / Notes</Label>
+          <Textarea
+            id="bisAction"
+            value={formData.bisAction}
+            onChange={(e) =>
+              setFormData({ ...formData, bisAction: e.target.value })
+            }
+            placeholder="Any BIS action items or notes..."
+            rows={2}
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-2">
+        <Label htmlFor="iecAction">IEC Action / Notes</Label>
+        <Textarea
+          id="iecAction"
+          value={formData.iecAction}
+          onChange={(e) =>
+            setFormData({ ...formData, iecAction: e.target.value })
+          }
+          placeholder="Any IEC action items or notes..."
+          rows={2}
+        />
+      </div>
+    );
   };
 
   return (
@@ -237,148 +747,200 @@ export const CertificationModal = ({
           </div>
 
           <div className="grid grid-cols-2 gap-4">
+            {/* R-No / ID (BIS/IEC conditional) */}
             <div className="space-y-2">
-              <Label htmlFor="rNo">R-No / ID *</Label>
-              <Input
-                id="rNo"
-                value={formData.rNo}
-                onChange={(e) =>
-                  setFormData({ ...formData, rNo: e.target.value })
+              {(() => {
+                // BIS & IEC => show both
+                if (flags.bis && flags.iec) {
+                  return (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="bisRNo">BIS R-No / ID *</Label>
+                        <Input
+                          id="bisRNo"
+                          value={formData.bisRNo}
+                          onChange={(e) =>
+                            setFormData({
+                              ...formData,
+                              bisRNo: e.target.value,
+                            })
+                          }
+                          placeholder="e.g., R-63002356"
+                          required
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="iecRNo">IEC R-No / ID *</Label>
+                        <Input
+                          id="iecRNo"
+                          value={formData.iecRNo}
+                          onChange={(e) =>
+                            setFormData({
+                              ...formData,
+                              iecRNo: e.target.value,
+                            })
+                          }
+                          placeholder="e.g., ID 1111296708"
+                          required
+                        />
+                      </div>
+                    </div>
+                  );
                 }
-                placeholder="e.g., R-63002356"
-                required
-              />
+
+                // Single type => show only that one
+                if (flags.bis) {
+                  return (
+                    <div className="space-y-2">
+                      <Label htmlFor="bisRNo">BIS R-No / ID *</Label>
+                      <Input
+                        id="bisRNo"
+                        value={formData.bisRNo}
+                        onChange={(e) =>
+                          setFormData({
+                            ...formData,
+                            bisRNo: e.target.value,
+                          })
+                        }
+                        placeholder="e.g., R-63002356"
+                        required
+                      />
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="space-y-2">
+                    <Label htmlFor="iecRNo">IEC R-No / ID *</Label>
+                    <Input
+                      id="iecRNo"
+                      value={formData.iecRNo}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          iecRNo: e.target.value,
+                        })
+                      }
+                      placeholder="e.g., ID 1111296708"
+                      required
+                    />
+                  </div>
+                );
+              })()}
             </div>
 
+            {/* Type checkboxes */}
             <div className="space-y-2">
-              <Label htmlFor="type">Type</Label>
-              <Select
-                value={formData.type}
-                onValueChange={(value: "BIS" | "IEC") =>
-                  setFormData({ ...formData, type: value })
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="BIS">BIS</SelectItem>
-                  <SelectItem value="IEC">IEC</SelectItem>
-                </SelectContent>
-              </Select>
+              <Label>Type</Label>
+              {(() => {
+                const current = parseTypeFlags(formData.type);
+
+                const setFlags = (next: { bis: boolean; iec: boolean }) => {
+                  // enforce at least one selected
+                  if (!next.bis && !next.iec) next.bis = true;
+
+                  setFormData({
+                    ...formData,
+                    type: flagsToType(next.bis, next.iec),
+                  });
+                };
+
+                return (
+                  <div className="flex items-center gap-6 rounded-md border p-3">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <Checkbox
+                        checked={current.bis}
+                        onCheckedChange={(v) =>
+                          setFlags({ bis: Boolean(v), iec: current.iec })
+                        }
+                      />
+                      <span className="text-sm">BIS</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <Checkbox
+                        checked={current.iec}
+                        onCheckedChange={(v) =>
+                          setFlags({ bis: current.bis, iec: Boolean(v) })
+                        }
+                      />
+                      <span className="text-sm">IEC</span>
+                    </label>
+
+                    <div className="ml-auto text-xs text-muted-foreground">
+                      Selected:{" "}
+                      <span className="font-medium">{formData.type}</span>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="status">Status</Label>
-            <Select
-              value={formData.status}
-              onValueChange={(value: Certification["status"]) =>
-                setFormData({ ...formData, status: value })
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="Active">Active</SelectItem>
-                <SelectItem value="Under process">Under Process</SelectItem>
-                <SelectItem value="Expired">Expired</SelectItem>
-                <SelectItem value="Pending">Pending</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {/* Status */}
+          {(() => {
+            if (flags.bis && flags.iec) {
+              return (
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>BIS Status</Label>
+                    <StatusSelect
+                      value={formData.bisStatus}
+                      onChange={(v) =>
+                        setFormData({ ...formData, bisStatus: v })
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>IEC Status</Label>
+                    <StatusSelect
+                      value={formData.iecStatus}
+                      onChange={(v) =>
+                        setFormData({ ...formData, iecStatus: v })
+                      }
+                    />
+                  </div>
+                </div>
+              );
+            }
 
-          <div className="space-y-2">
-            <Label htmlFor="modelList">Model List</Label>
-            <Textarea
-              id="modelList"
-              value={formData.modelList}
-              onChange={(e) =>
-                setFormData({ ...formData, modelList: e.target.value })
-              }
-              placeholder="List of models..."
-              rows={3}
-            />
-          </div>
+            if (flags.bis) {
+              return (
+                <div className="space-y-2">
+                  <Label>BIS Status</Label>
+                  <StatusSelect
+                    value={formData.bisStatus}
+                    onChange={(v) => setFormData({ ...formData, bisStatus: v })}
+                  />
+                </div>
+              );
+            }
 
-          <div className="space-y-2">
-            <Label htmlFor="standard">Standard</Label>
-            <Textarea
-              id="standard"
-              value={formData.standard}
-              onChange={(e) =>
-                setFormData({ ...formData, standard: e.target.value })
-              }
-              placeholder="Applicable standards..."
-              rows={2}
-            />
-          </div>
+            return (
+              <div className="space-y-2">
+                <Label>IEC Status</Label>
+                <StatusSelect
+                  value={formData.iecStatus}
+                  onChange={(v) => setFormData({ ...formData, iecStatus: v })}
+                />
+              </div>
+            );
+          })()}
 
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="validityFrom">Validity From</Label>
-              <Input
-                id="validityFrom"
-                type="date"
-                value={formData.validityFrom}
-                onChange={(e) =>
-                  setFormData({ ...formData, validityFrom: e.target.value })
-                }
-              />
-            </div>
+          {/* Model List */}
+          {renderModelList()}
 
-            <div className="space-y-2">
-              <Label htmlFor="validityUpto">Validity Upto</Label>
-              <Input
-                id="validityUpto"
-                type="date"
-                value={formData.validityUpto}
-                onChange={(e) =>
-                  setFormData({ ...formData, validityUpto: e.target.value })
-                }
-              />
-            </div>
-          </div>
+          {/* Standard */}
+          {renderStandard()}
 
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="renewalStatus">Renewal Status</Label>
-              <Input
-                id="renewalStatus"
-                value={formData.renewalStatus}
-                onChange={(e) =>
-                  setFormData({ ...formData, renewalStatus: e.target.value })
-                }
-                placeholder="e.g., Renewal initiated / date / remarks"
-              />
-            </div>
+          {/* Validity (From/Upto) */}
+          {renderValidity()}
 
-            <div className="space-y-2">
-              <Label htmlFor="alarmAlert">Alarm Alert</Label>
-              <Input
-                id="alarmAlert"
-                value={formData.alarmAlert}
-                onChange={(e) =>
-                  setFormData({ ...formData, alarmAlert: e.target.value })
-                }
-                placeholder="e.g., - / Alert configured / rule"
-              />
-            </div>
-          </div>
+          {/* Renewal + Alarm */}
+          {renderRenewalAndAlarm()}
 
-          <div className="space-y-2">
-            <Label htmlFor="action">Action / Notes</Label>
-            <Textarea
-              id="action"
-              value={formData.action}
-              onChange={(e) =>
-                setFormData({ ...formData, action: e.target.value })
-              }
-              placeholder="Any action items or notes..."
-              rows={2}
-            />
-          </div>
+          {/* Action */}
+          {renderAction()}
 
           {/* Attachment */}
           <div className="space-y-2">

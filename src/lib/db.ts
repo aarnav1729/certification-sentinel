@@ -6,16 +6,31 @@ export interface Certification {
   sno: number;
   plant: string;
   address: string;
-  rNo: string;
-  type: "BIS" | "IEC";
-  status: "Active" | "Under process" | "Expired" | "Pending";
-  modelList: string;
-  standard: string;
-  validityFrom: string; // YYYY-MM-DD
-  validityUpto: string; // YYYY-MM-DD
-  renewalStatus?: string;
-  alarmAlert?: string;
-  action?: string;
+
+  // derived overall type
+  type: "BIS" | "IEC" | "BIS & IEC";
+
+  // BIS fields
+  bisRNo?: string;
+  bisStatus?: "Active" | "Under process" | "Expired" | "Pending";
+  bisModelList?: string;
+  bisStandard?: string;
+  bisValidityFrom?: string; // YYYY-MM-DD
+  bisValidityUpto?: string; // YYYY-MM-DD
+  bisRenewalStatus?: string;
+  bisAlarmAlert?: string;
+  bisAction?: string;
+
+  // IEC fields
+  iecRNo?: string;
+  iecStatus?: "Active" | "Under process" | "Expired" | "Pending";
+  iecModelList?: string;
+  iecStandard?: string;
+  iecValidityFrom?: string; // YYYY-MM-DD
+  iecValidityUpto?: string; // YYYY-MM-DD
+  iecRenewalStatus?: string;
+  iecAlarmAlert?: string;
+  iecAction?: string;
 
   // Attachment (optional; file stored in backend)
   hasAttachment?: boolean;

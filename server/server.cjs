@@ -21,6 +21,7 @@ const helmet = require("helmet");
 const compression = require("compression");
 const morgan = require("morgan");
 const sql = require("mssql");
+const XLSX = require("xlsx");
 
 // Microsoft Graph
 const { Client } = require("@microsoft/microsoft-graph-client");
@@ -164,6 +165,358 @@ app.use(
 app.use(express.json({ limit: "15mb" }));
 
 /* ========================= DB Helpers ========================= */
+/* ========================= Admin Reset (Excel -> DB) ========================= */
+
+// Put the excel in: root/server/seed/BIS & IEC Certification Validity Tracker.xlsx
+// OR set: CERT_SEED_XLSX_PATH=/absolute/path/to/file.xlsx
+const CERT_SEED_XLSX_PATH =
+  String(process.env.CERT_SEED_XLSX_PATH || "").trim() ||
+  path.join(__dirname, "seed", "Book 96.xlsx");
+
+// REQUIRED to protect destructive endpoint
+// Call endpoint with header: x-admin-token: <value>
+const ADMIN_RESET_TOKEN = String(process.env.ADMIN_RESET_TOKEN || "").trim();
+
+// Common recipient list (seeded on every reset)
+const DEFAULT_RECIPIENTS = [
+  { name: "Chiranjeev Saluja", email: "saluja@premierenergies.com", role: "" },
+  {
+    name: "Vishnu Hazari",
+    email: "vishnu.hazari@premierenergies.com",
+    role: "",
+  },
+  {
+    name: "Chandra Mauli Kumar",
+    email: "chandra.kumar@premierenergies.com",
+    role: "",
+  },
+  {
+    name: "Vinay Rustagi",
+    email: "vinay.rustagi@premierenergies.com",
+    role: "",
+  },
+  {
+    name: "Saumya Ranjan",
+    email: "saumya.ranjan@premierenergies.com",
+    role: "",
+  },
+  { name: "D N RAO", email: "nrao@premierenergies.com", role: "" },
+  { name: "M P Singh", email: "singhmp@premierenergies.com", role: "" },
+  { name: "Jasveen Saluja", email: "jasveen@premierenergies.com", role: "" },
+  {
+    name: "Venkata Pavan Kumar Koyyalamudi",
+    email: "venkatapavankumar.k@premierenergies.com",
+    role: "",
+  },
+  { name: "Ramesh T", email: "ramesh.t@premierenergies.com", role: "" },
+  {
+    name: "Baskara Pandian T",
+    email: "baskara.pandian@premierenergies.com",
+    role: "",
+  },
+  {
+    name: "Praful Bharadwaj",
+    email: "praful.bharadwaj@premierenergies.com",
+    role: "",
+  },
+];
+function isIdKey(k) {
+  const s = String(k || "").toLowerCase();
+  return s === "id" || s.endsWith("id"); // ✅ NOT includes("id")
+}
+
+function isValidityDateKey(k) {
+  const s = String(k || "").toLowerCase();
+  return s.endsWith("validityfrom") || s.endsWith("validityupto");
+}
+
+function isGuidKey(key) {
+  const k = String(key || "").toLowerCase();
+  return k === "id" || k.endsWith("id"); // ✅ do NOT use includes("id")
+}
+
+function isDateKey(key) {
+  const k = String(key || "").toLowerCase();
+  return (
+    k === "validityfrom" ||
+    k === "validityupto" ||
+    k.endsWith("validityfrom") ||
+    k.endsWith("validityupto")
+  );
+}
+
+// Bind helper (re-used for transaction + non-transaction)
+function bindInputs(req, bind = {}) {
+  for (const [k, v] of Object.entries(bind)) {
+    const key = String(k || "").toLowerCase();
+
+    // ✅ NULL / UNDEFINED MUST HAVE AN EXPLICIT TYPE
+    if (v === null || typeof v === "undefined") {
+      if (key === "attachmentdata" || key.endsWith("data")) {
+        req.input(k, sql.VarBinary(sql.MAX), null);
+      } else if (isDateKey(key)) {
+        req.input(k, sql.Date, null);
+      } else if (key.endsWith("at")) {
+        req.input(k, sql.DateTime2, null);
+      } else if (key === "sno") {
+        req.input(k, sql.Int, null);
+      } else if (key === "isactive") {
+        req.input(k, sql.Bit, null);
+      } else if (isGuidKey(key)) {
+        req.input(k, sql.UniqueIdentifier, null);
+      } else {
+        req.input(k, sql.NVarChar(sql.MAX), null);
+      }
+      continue;
+    }
+
+    // ✅ GUID strings (only for real id keys)
+    if (
+      isGuidKey(key) &&
+      typeof v === "string" &&
+      /^[0-9a-fA-F-]{36}$/.test(v)
+    ) {
+      req.input(k, sql.UniqueIdentifier, v);
+      continue;
+    }
+
+    // ✅ booleans
+    if (typeof v === "boolean") {
+      req.input(k, sql.Bit, v);
+      continue;
+    }
+
+    // ✅ numbers (int vs float)
+    if (typeof v === "number" && Number.isFinite(v)) {
+      if (Number.isInteger(v)) req.input(k, sql.Int, v);
+      else req.input(k, sql.Float, v);
+      continue;
+    }
+
+    // ✅ Date objects
+    if (v instanceof Date) {
+      if (isDateKey(key)) req.input(k, sql.Date, v);
+      else req.input(k, sql.DateTime2, v);
+      continue;
+    }
+
+    // ✅ Date strings for date keys (important for seed / excel paths)
+    if (typeof v === "string" && isDateKey(key)) {
+      const d = parseDateOrNull(v);
+      req.input(k, sql.Date, d);
+      continue;
+    }
+    if (typeof v === "string" && key.endsWith("at")) {
+      const d = new Date(v);
+      req.input(k, sql.DateTime2, Number.isNaN(d.getTime()) ? null : d);
+      continue;
+    }
+
+    // ✅ buffers
+    if (Buffer.isBuffer(v)) {
+      req.input(k, sql.VarBinary(sql.MAX), v);
+      continue;
+    }
+
+    // ✅ strings and everything else
+    req.input(k, sql.NVarChar(sql.MAX), String(v));
+  }
+}
+
+// Transaction-safe exec
+async function execSqlTx(tx, queryText, bind = {}) {
+  const req = tx.request();
+  bindInputs(req, bind);
+  return req.query(queryText);
+}
+
+function cleanStr(v) {
+  if (v === null || typeof v === "undefined") return "";
+  if (v instanceof Date) return toYMD(v);
+  return String(v).replace(/\r\n/g, "\n").trim();
+}
+
+function normalizeCertType(raw) {
+  const s = String(raw || "")
+    .trim()
+    .toUpperCase();
+  const hasBIS = s.includes("BIS");
+  const hasIEC = s.includes("IEC");
+
+  if (hasBIS && hasIEC) return "BIS & IEC";
+  if (hasIEC) return "IEC";
+  return "BIS"; // default
+}
+
+// Excel -> certification rows (maps your sheet columns 1:1)
+function excelSerialToDate(n) {
+  // XLSX serial date -> JS Date (supports typical Excel 1900 date system)
+  // XLSX.SSF.parse_date_code returns {y,m,d,...} for valid serials
+  if (typeof n !== "number" || !Number.isFinite(n)) return null;
+  const dc = XLSX.SSF.parse_date_code(n);
+  if (!dc || !dc.y || !dc.m || !dc.d) return null;
+  return new Date(Date.UTC(dc.y, dc.m - 1, dc.d));
+}
+
+function excelCellToDate(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === "number") {
+    // Many sheets store dates as numbers even when formatted as date
+    return excelSerialToDate(v);
+  }
+  // Try parsing strings (YYYY-MM-DD or similar)
+  const s = String(v).trim();
+  if (!s) return null;
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+// Excel -> certification rows (Book 96 format: BIS row has S.No, IEC row has blank S.No)
+function readCertificationsFromExcel(filePath) {
+  if (!fs.existsSync(filePath)) {
+    const err = new Error(`Excel file not found at: ${filePath}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const wb = XLSX.readFile(filePath, { cellDates: true });
+  const sheetName = wb.SheetNames?.[0];
+  if (!sheetName) {
+    const err = new Error("Excel has no sheets");
+    err.status = 400;
+    throw err;
+  }
+
+  const ws = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(ws, {
+    header: 1,
+    defval: null,
+    raw: true,
+  });
+  if (!rows?.length) return [];
+
+  // Columns (0-index):
+  // 0 S.no, 1 Plant, 2 Address, 3 R- No, 4 Type, 5 Status, 6 Model list, 7 Standard,
+  // 8 Validity From, 9 Validity Upto, 10 Renewal Status, 11 Alarm Alert, 12 Action
+
+  const map = new Map(); // sno -> combined record
+  let lastSno = null;
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const snoRaw = r[0];
+
+    let sno =
+      typeof snoRaw === "number"
+        ? Math.trunc(snoRaw)
+        : /^\d+$/.test(String(snoRaw || "").trim())
+        ? parseInt(String(snoRaw).trim(), 10)
+        : null;
+
+    // ✅ Book 96: IEC row has blank S.No → carry forward previous S.No
+    if (!sno && lastSno) sno = lastSno;
+    if (!sno) continue;
+    lastSno = sno;
+
+    const plant = cleanStr(r[1]);
+    const address = cleanStr(r[2]);
+    const rNo = cleanStr(r[3]) || "";
+
+    // row-level type is BIS or IEC
+    const type = normalizeCertType(cleanStr(r[4]) || "BIS");
+
+    const status = cleanStr(r[5]) || "Pending";
+    const modelList = cleanStr(r[6]);
+    const standard = cleanStr(r[7]);
+
+    const vf = excelCellToDate(r[8]) || null;
+    const vu = excelCellToDate(r[9]) || null;
+
+    // Renewal Status sometimes is a date or string
+    const renewalRaw = r[10];
+    const renewalDate = excelCellToDate(renewalRaw);
+    const renewalStatus = renewalDate
+      ? toYMD(renewalDate)
+      : cleanStr(renewalRaw);
+
+    const alarmAlert = cleanStr(r[11]);
+    const action = cleanStr(r[12]);
+
+    if (!map.has(sno)) {
+      map.set(sno, {
+        sno,
+        plant: plant || `Plant ${sno}`,
+        address: address || null,
+
+        // BIS fields
+        bisRNo: null,
+        bisStatus: null,
+        bisModelList: null,
+        bisStandard: null,
+        bisValidityFrom: null,
+        bisValidityUpto: null,
+        bisRenewalStatus: null,
+        bisAlarmAlert: null,
+        bisAction: null,
+
+        // IEC fields
+        iecRNo: null,
+        iecStatus: null,
+        iecModelList: null,
+        iecStandard: null,
+        iecValidityFrom: null,
+        iecValidityUpto: null,
+        iecRenewalStatus: null,
+        iecAlarmAlert: null,
+        iecAction: null,
+      });
+    }
+
+    const item = map.get(sno);
+
+    // Prefer non-empty shared fields
+    if (plant && !item.plant) item.plant = plant;
+    if (address && !item.address) item.address = address;
+
+    if (type === "BIS") {
+      item.bisRNo = rNo || item.bisRNo;
+      item.bisStatus = status || item.bisStatus;
+      item.bisModelList = modelList || item.bisModelList;
+      item.bisStandard = standard || item.bisStandard;
+      item.bisValidityFrom = vf || item.bisValidityFrom;
+      item.bisValidityUpto = vu || item.bisValidityUpto;
+      item.bisRenewalStatus = renewalStatus || item.bisRenewalStatus;
+      item.bisAlarmAlert = alarmAlert || item.bisAlarmAlert;
+      item.bisAction = action || item.bisAction;
+    } else {
+      item.iecRNo = rNo || item.iecRNo;
+      item.iecStatus = status || item.iecStatus;
+      item.iecModelList = modelList || item.iecModelList;
+      item.iecStandard = standard || item.iecStandard;
+      item.iecValidityFrom = vf || item.iecValidityFrom;
+      item.iecValidityUpto = vu || item.iecValidityUpto;
+      item.iecRenewalStatus = renewalStatus || item.iecRenewalStatus;
+      item.iecAlarmAlert = alarmAlert || item.iecAlarmAlert;
+      item.iecAction = action || item.iecAction;
+    }
+  }
+
+  const out = Array.from(map.values()).map((x) => {
+    const hasBIS = Boolean(
+      x.bisRNo || x.bisStatus || x.bisValidityUpto || x.bisValidityFrom
+    );
+    const hasIEC = Boolean(
+      x.iecRNo || x.iecStatus || x.iecValidityUpto || x.iecValidityFrom
+    );
+    x.type = hasBIS && hasIEC ? "BIS & IEC" : hasIEC ? "IEC" : "BIS";
+    return x;
+  });
+
+  out.sort((a, b) => a.sno - b.sno);
+  return out;
+}
 
 let pool;
 
@@ -209,81 +562,17 @@ async function connectDb() {
 async function execSql(queryText, bind = {}) {
   const p = await connectDb();
   const req = p.request();
-
-  for (const [k, v] of Object.entries(bind)) {
-    const key = String(k || "").toLowerCase();
-
-    // ✅ NULL / UNDEFINED MUST HAVE AN EXPLICIT TYPE (otherwise mssql may throw)
-    if (v === null || typeof v === "undefined") {
-      if (key === "attachmentdata" || key.endsWith("data")) {
-        req.input(k, sql.VarBinary(sql.MAX), null);
-      } else if (key === "validityfrom" || key === "validityupto") {
-        req.input(k, sql.Date, null);
-      } else if (key.endsWith("at")) {
-        req.input(k, sql.DateTime2, null);
-      } else if (key === "sno") {
-        req.input(k, sql.Int, null);
-      } else if (key === "isactive") {
-        req.input(k, sql.Bit, null);
-      } else if (key.includes("id")) {
-        req.input(k, sql.UniqueIdentifier, null);
-      } else {
-        req.input(k, sql.NVarChar(sql.MAX), null);
-      }
-      continue;
-    }
-
-    // GUIDs
-    if (
-      key.includes("id") &&
-      typeof v === "string" &&
-      /^[0-9a-fA-F-]{36}$/.test(v)
-    ) {
-      req.input(k, sql.UniqueIdentifier, v);
-      continue;
-    }
-
-    // booleans
-    if (typeof v === "boolean") {
-      req.input(k, sql.Bit, v);
-      continue;
-    }
-
-    // ints
-    if (typeof v === "number" && Number.isInteger(v)) {
-      req.input(k, sql.Int, v);
-      continue;
-    }
-
-    // dates
-    if (v instanceof Date) {
-      if (key === "validityfrom" || key === "validityupto") {
-        req.input(k, sql.Date, v);
-      } else {
-        req.input(k, sql.DateTime2, v);
-      }
-      continue;
-    }
-
-    // buffers
-    if (Buffer.isBuffer(v)) {
-      req.input(k, sql.VarBinary(sql.MAX), v);
-      continue;
-    }
-
-    // strings and everything else
-    req.input(k, sql.NVarChar(sql.MAX), String(v));
-  }
-
+  bindInputs(req, bind);
   return req.query(queryText);
 }
-
 
 /* ========================= CREATE IF NOT EXISTS (Tables + Indexes) ========================= */
 
 async function ensureSchema() {
   const ddl = `
-/* ===== Certifications ===== */
+/* =========================
+   Certifications
+========================= */
 IF OBJECT_ID(N'dbo.Certifications', N'U') IS NULL
 BEGIN
   CREATE TABLE dbo.Certifications (
@@ -291,16 +580,30 @@ BEGIN
     sno INT NOT NULL,
     plant NVARCHAR(200) NOT NULL,
     address NVARCHAR(MAX) NULL,
-    rNo NVARCHAR(120) NOT NULL,
-    type NVARCHAR(10) NOT NULL,          -- BIS / IEC
-    status NVARCHAR(30) NOT NULL,        -- Active / Under process / Expired / Pending
-    modelList NVARCHAR(MAX) NULL,
-    standard NVARCHAR(MAX) NULL,
-    validityFrom DATE NULL,
-    validityUpto DATE NULL,
-    renewalStatus NVARCHAR(120) NULL,
-    alarmAlert NVARCHAR(120) NULL,
-    action NVARCHAR(MAX) NULL,
+
+    type NVARCHAR(20) NOT NULL,  -- BIS / IEC / BIS & IEC
+
+    /* BIS fields */
+    bisRNo NVARCHAR(120) NULL,
+    bisStatus NVARCHAR(30) NULL,
+    bisModelList NVARCHAR(MAX) NULL,
+    bisStandard NVARCHAR(MAX) NULL,
+    bisValidityFrom DATE NULL,
+    bisValidityUpto DATE NULL,
+    bisRenewalStatus NVARCHAR(120) NULL,
+    bisAlarmAlert NVARCHAR(120) NULL,
+    bisAction NVARCHAR(MAX) NULL,
+
+    /* IEC fields */
+    iecRNo NVARCHAR(120) NULL,
+    iecStatus NVARCHAR(30) NULL,
+    iecModelList NVARCHAR(MAX) NULL,
+    iecStandard NVARCHAR(MAX) NULL,
+    iecValidityFrom DATE NULL,
+    iecValidityUpto DATE NULL,
+    iecRenewalStatus NVARCHAR(120) NULL,
+    iecAlarmAlert NVARCHAR(120) NULL,
+    iecAction NVARCHAR(MAX) NULL,
 
     /* Attachment (optional) */
     attachmentName NVARCHAR(260) NULL,
@@ -311,6 +614,40 @@ BEGIN
     updatedAt DATETIME2(3) NOT NULL
   );
 END;
+
+/* ---- Ensure type width (idempotent upgrade) ---- */
+IF EXISTS (
+  SELECT 1
+  FROM sys.columns
+  WHERE object_id = OBJECT_ID(N'dbo.Certifications')
+    AND name = N'type'
+    AND max_length < 40  -- NVARCHAR(20) = 40 bytes
+)
+BEGIN
+  ALTER TABLE dbo.Certifications ALTER COLUMN type NVARCHAR(20) NOT NULL;
+END;
+
+/* ---- Ensure BIS columns exist (idempotent upgrades) ---- */
+IF COL_LENGTH(N'dbo.Certifications', N'bisRNo') IS NULL ALTER TABLE dbo.Certifications ADD bisRNo NVARCHAR(120) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisStatus') IS NULL ALTER TABLE dbo.Certifications ADD bisStatus NVARCHAR(30) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisModelList') IS NULL ALTER TABLE dbo.Certifications ADD bisModelList NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisStandard') IS NULL ALTER TABLE dbo.Certifications ADD bisStandard NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisValidityFrom') IS NULL ALTER TABLE dbo.Certifications ADD bisValidityFrom DATE NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisValidityUpto') IS NULL ALTER TABLE dbo.Certifications ADD bisValidityUpto DATE NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisRenewalStatus') IS NULL ALTER TABLE dbo.Certifications ADD bisRenewalStatus NVARCHAR(120) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisAlarmAlert') IS NULL ALTER TABLE dbo.Certifications ADD bisAlarmAlert NVARCHAR(120) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'bisAction') IS NULL ALTER TABLE dbo.Certifications ADD bisAction NVARCHAR(MAX) NULL;
+
+/* ---- Ensure IEC columns exist (idempotent upgrades) ---- */
+IF COL_LENGTH(N'dbo.Certifications', N'iecRNo') IS NULL ALTER TABLE dbo.Certifications ADD iecRNo NVARCHAR(120) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecStatus') IS NULL ALTER TABLE dbo.Certifications ADD iecStatus NVARCHAR(30) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecModelList') IS NULL ALTER TABLE dbo.Certifications ADD iecModelList NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecStandard') IS NULL ALTER TABLE dbo.Certifications ADD iecStandard NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecValidityFrom') IS NULL ALTER TABLE dbo.Certifications ADD iecValidityFrom DATE NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecValidityUpto') IS NULL ALTER TABLE dbo.Certifications ADD iecValidityUpto DATE NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecRenewalStatus') IS NULL ALTER TABLE dbo.Certifications ADD iecRenewalStatus NVARCHAR(120) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecAlarmAlert') IS NULL ALTER TABLE dbo.Certifications ADD iecAlarmAlert NVARCHAR(120) NULL;
+IF COL_LENGTH(N'dbo.Certifications', N'iecAction') IS NULL ALTER TABLE dbo.Certifications ADD iecAction NVARCHAR(MAX) NULL;
 
 /* ---- Ensure attachment columns exist (idempotent upgrades) ---- */
 IF COL_LENGTH(N'dbo.Certifications', N'attachmentName') IS NULL
@@ -328,6 +665,80 @@ BEGIN
   ALTER TABLE dbo.Certifications ADD attachmentData VARBINARY(MAX) NULL;
 END;
 
+/* ---- Legacy single-row columns (backward compatibility) ---- */
+/* Some existing DBs already have these columns as NOT NULL.
+   Our Excel-reset path does not populate them, so we must allow NULLs. */
+
+IF COL_LENGTH(N'dbo.Certifications', N'rNo') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD rNo NVARCHAR(120) NULL;
+END
+ELSE
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'dbo.Certifications')
+      AND name = N'rNo'
+      AND is_nullable = 0
+  )
+  BEGIN
+    ALTER TABLE dbo.Certifications ALTER COLUMN rNo NVARCHAR(120) NULL;
+  END
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'status') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD status NVARCHAR(30) NULL;
+END
+ELSE
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'dbo.Certifications')
+      AND name = N'status'
+      AND is_nullable = 0
+  )
+  BEGIN
+    ALTER TABLE dbo.Certifications ALTER COLUMN status NVARCHAR(30) NULL;
+  END
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'modelList') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD modelList NVARCHAR(MAX) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'standard') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD standard NVARCHAR(MAX) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'validityFrom') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD validityFrom DATE NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'validityUpto') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD validityUpto DATE NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'renewalStatus') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD renewalStatus NVARCHAR(120) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'alarmAlert') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD alarmAlert NVARCHAR(120) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'action') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD action NVARCHAR(MAX) NULL;
+END;
+
+/* ---- Indexes ---- */
 IF NOT EXISTS (
   SELECT 1 FROM sys.indexes
   WHERE name = N'IX_Certifications_Plant' AND object_id = OBJECT_ID(N'dbo.Certifications')
@@ -338,21 +749,47 @@ END;
 
 IF NOT EXISTS (
   SELECT 1 FROM sys.indexes
-  WHERE name = N'IX_Certifications_Status' AND object_id = OBJECT_ID(N'dbo.Certifications')
+  WHERE name = N'IX_Certifications_Type' AND object_id = OBJECT_ID(N'dbo.Certifications')
 )
 BEGIN
-  CREATE INDEX IX_Certifications_Status ON dbo.Certifications(status);
+  CREATE INDEX IX_Certifications_Type ON dbo.Certifications(type);
 END;
 
 IF NOT EXISTS (
   SELECT 1 FROM sys.indexes
-  WHERE name = N'IX_Certifications_ValidityUpto' AND object_id = OBJECT_ID(N'dbo.Certifications')
+  WHERE name = N'IX_Certifications_BIS_Status' AND object_id = OBJECT_ID(N'dbo.Certifications')
 )
 BEGIN
-  CREATE INDEX IX_Certifications_ValidityUpto ON dbo.Certifications(validityUpto);
+  CREATE INDEX IX_Certifications_BIS_Status ON dbo.Certifications(bisStatus);
 END;
 
-/* ===== Email Recipients ===== */
+IF NOT EXISTS (
+  SELECT 1 FROM sys.indexes
+  WHERE name = N'IX_Certifications_IEC_Status' AND object_id = OBJECT_ID(N'dbo.Certifications')
+)
+BEGIN
+  CREATE INDEX IX_Certifications_IEC_Status ON dbo.Certifications(iecStatus);
+END;
+
+IF NOT EXISTS (
+  SELECT 1 FROM sys.indexes
+  WHERE name = N'IX_Certifications_BIS_ValidityUpto' AND object_id = OBJECT_ID(N'dbo.Certifications')
+)
+BEGIN
+  CREATE INDEX IX_Certifications_BIS_ValidityUpto ON dbo.Certifications(bisValidityUpto);
+END;
+
+IF NOT EXISTS (
+  SELECT 1 FROM sys.indexes
+  WHERE name = N'IX_Certifications_IEC_ValidityUpto' AND object_id = OBJECT_ID(N'dbo.Certifications')
+)
+BEGIN
+  CREATE INDEX IX_Certifications_IEC_ValidityUpto ON dbo.Certifications(iecValidityUpto);
+END;
+
+/* =========================
+   Email Recipients
+========================= */
 IF OBJECT_ID(N'dbo.EmailRecipients', N'U') IS NULL
 BEGIN
   CREATE TABLE dbo.EmailRecipients (
@@ -374,7 +811,9 @@ BEGIN
   CREATE UNIQUE INDEX UX_EmailRecipients_Email ON dbo.EmailRecipients(email);
 END;
 
-/* ===== Email Logs ===== */
+/* =========================
+   Email Logs
+========================= */
 IF OBJECT_ID(N'dbo.EmailLogs', N'U') IS NULL
 BEGIN
   CREATE TABLE dbo.EmailLogs (
@@ -382,7 +821,7 @@ BEGIN
     certificationId UNIQUEIDENTIFIER NOT NULL,
     recipientEmail NVARCHAR(320) NOT NULL,
     emailType NVARCHAR(20) NOT NULL,     -- reminder / overdue
-    milestone NVARCHAR(50) NOT NULL,     -- 6-months / 3-months / month / 2-weeks / week / day-before / overdue
+    milestone NVARCHAR(50) NOT NULL,     -- BIS:6-months / IEC:overdue / etc.
     sentAt DATETIME2(3) NOT NULL,
     status NVARCHAR(20) NOT NULL,        -- sent / failed
     error NVARCHAR(MAX) NULL
@@ -436,93 +875,165 @@ async function seedIfEmpty() {
       plant: "PEPPL (P2)",
       address:
         "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
-      rNo: "R-63002356",
-      type: "BIS",
-      status: "Active",
-      modelList:
+      type: "BIS & IEC",
+
+      // BIS
+      bisRNo: "R-63002356",
+      bisStatus: "Active",
+      bisModelList:
         "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 550 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 550 to 525)",
-      standard:
+      bisStandard:
         "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
-      validityFrom: "2021-07-29",
-      validityUpto: "2028-07-28",
-      renewalStatus: "7/28/2028",
-      alarmAlert: "-",
-      action: "-",
+      bisValidityFrom: "2021-07-29",
+      bisValidityUpto: "2023-07-28",
+      bisRenewalStatus: "46962",
+      bisAlarmAlert: "",
+      bisAction: "-",
+
+      // IEC
+      iecRNo: "ID 1111296708",
+      iecStatus: "Active",
+      iecModelList:
+        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      iecStandard:
+        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
+      iecValidityFrom: "2025-01-24",
+      iecValidityUpto: "2030-01-23",
+      iecRenewalStatus: null,
+      iecAlarmAlert: null,
+      iecAction: null,
     },
+
     {
       sno: 2,
-      plant: "PEPPL (P2)",
-      address:
-        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
-      rNo: "ID 1111296708",
-      type: "IEC",
-      status: "Active",
-      modelList:
-        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
-      standard:
-        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023",
-      validityFrom: "2025-01-24",
-      validityUpto: "2030-01-23",
-    },
-    {
-      sno: 3,
       plant: "PEIPL (P4)",
       address:
-        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESHWARAM(M), RANGAREDDY(D)- 501359",
-      rNo: "R-63003719",
-      type: "BIS",
-      status: "Under process",
-      modelList:
-        "Perc Transparent M10: PEI-144-xxxHB-M10 (where xxx- 555 to 525)\nPerc Dual Glass M10: PEI-144-xxxHGB-M10 (where xxx- 555 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
-      standard:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      type: "BIS & IEC",
+
+      // BIS
+      bisRNo: "R-63003719",
+      bisStatus: "Under process",
+      bisModelList:
+        "Perc Transparent M10: PEI-144-xxxHB-M10 (where xxx- 555 to 525)\nPerc Dual Glass M10: PEI-144-xxxHGB-M10 (where xxx- 555 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
+      bisStandard:
         "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
-      validityFrom: "2023-12-19",
-      validityUpto: "2025-12-18",
-      action:
+      bisValidityFrom: "2023-12-19",
+      bisValidityUpto: "2025-12-18",
+      bisRenewalStatus: "",
+      bisAlarmAlert: "Start Certification",
+      bisAction:
         "Samples are already submitted. Expected BIS certification by W3 of Jan'26",
+
+      // IEC (same IEC block shown)
+      iecRNo: "ID 1111296708",
+      iecStatus: "Active",
+      iecModelList:
+        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      iecStandard:
+        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
+      iecValidityFrom: "2025-01-24",
+      iecValidityUpto: "2030-01-23",
+      iecRenewalStatus: null,
+      iecAlarmAlert: null,
+      iecAction: null,
     },
+
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      type: "BIS & IEC",
+
+      // BIS
+      bisRNo: "R-63004740",
+      bisStatus: "Active",
+      bisModelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)\nTopCON Dual Glass G12: PE-132-xxxTHGB-G12 (where xxx-680 to 710)",
+      bisStandard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      bisValidityFrom: "2025-01-21",
+      bisValidityUpto: "2027-01-09",
+      bisRenewalStatus: "",
+      bisAlarmAlert: "",
+      bisAction: "-",
+
+      // IEC
+      iecRNo: "ID 1111296708",
+      iecStatus: "Active",
+      iecModelList:
+        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      iecStandard:
+        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
+      iecValidityFrom: "2025-01-24",
+      iecValidityUpto: "2030-01-23",
+      iecRenewalStatus: null,
+      iecAlarmAlert: null,
+      iecAction: null,
+    },
+
     {
       sno: 4,
-      plant: "PEGEPL (P5)",
-      address:
-        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESHWARAM, MAHESHWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
-      rNo: "R-63004740",
-      type: "BIS",
-      status: "Active",
-      modelList:
-        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)\nTopCON Dual Glass G12: PE-132-xxxTHGB-G12 (where xxx-680 to 710)",
-      standard:
-        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
-      validityFrom: "2025-01-21",
-      validityUpto: "2027-01-09",
+      plant: "PEGEPL(P6)",
+      address: "303, 304, 305 AND 306/2, IALA-MAHESWARAM, RANGAREDDY",
+      type: "BIS & IEC",
+
+      // BIS
+      bisRNo: "R-63005460",
+      bisStatus: "Active",
+      bisModelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
+      bisStandard:
+        "IS 14286 (PART 1/SEC 1) : 2023/ IEC 61215-1-1: 2021 & IS/IEC 61730-1: 2016 & IS/IEC 61730-2: 2016",
+      bisValidityFrom: "2025-12-11",
+      bisValidityUpto: "2027-12-10",
+      bisRenewalStatus: "",
+      bisAlarmAlert: "",
+      bisAction: "-",
+
+      // IEC
+      iecRNo: "ID 1111296708",
+      iecStatus: "Active",
+      iecModelList:
+        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      iecStandard:
+        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
+      iecValidityFrom: "2025-01-24",
+      iecValidityUpto: "2030-01-23",
+      iecRenewalStatus: null,
+      iecAlarmAlert: null,
+      iecAction: null,
     },
+
     {
       sno: 5,
-      plant: "PEGEPL (P6)",
-      address: "303, 304, 305 AND 306/2, IALA-MAHESHWARAM, RANGAREDDY",
-      rNo: "R-63005460",
-      type: "BIS",
-      status: "Active",
-      modelList:
-        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
-      standard:
-        "IS 14286 (PART 1/SEC 1) : 2023/ IEC 61215-1-1: 2021 & IS/IEC 61730-1: 2016 & IS/IEC 61730-2: 2016",
-      validityFrom: "2025-12-11",
-      validityUpto: "2027-12-10",
-    },
-    {
-      sno: 6,
-      plant: "PEGEPL (P7)",
+      plant: "PEGEPL(P7)",
       address: "TBD",
-      rNo: "TBD",
       type: "BIS",
-      status: "Pending",
-      modelList: "TBD",
-      standard: "TBD",
-      validityFrom: "",
-      validityUpto: "",
-      action:
+
+      // BIS
+      bisRNo: "TBD",
+      bisStatus: "Pending",
+      bisModelList: "TBD",
+      bisStandard: "TBD",
+      bisValidityFrom: null,
+      bisValidityUpto: null,
+      bisRenewalStatus: "",
+      bisAlarmAlert: "Start Certification",
+      bisAction:
         "Samples are already submitted. Expected BIS certification by WW3 of Jan'26",
+
+      // IEC (not provided for P7 in your pasted table)
+      iecRNo: null,
+      iecStatus: null,
+      iecModelList: null,
+      iecStandard: null,
+      iecValidityFrom: null,
+      iecValidityUpto: null,
+      iecRenewalStatus: null,
+      iecAlarmAlert: null,
+      iecAction: null,
     },
   ];
 
@@ -531,35 +1042,51 @@ async function seedIfEmpty() {
     await execSql(
       `
 INSERT INTO dbo.Certifications (
-  id, sno, plant, address, rNo, type, status, modelList, standard,
-  validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+  id, sno, plant, address, type,
+
+  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+
   attachmentName, attachmentType, attachmentData,
   createdAt, updatedAt
 ) VALUES (
-  @id, @sno, @plant, @address, @rNo, @type, @status, @modelList, @standard,
-  @validityFrom, @validityUpto, @renewalStatus, @alarmAlert, @action,
-  @attachmentName, @attachmentType, @attachmentData,
+  @id, @sno, @plant, @address, @type,
+
+  @bisRNo, @bisStatus, @bisModelList, @bisStandard, @bisValidityFrom, @bisValidityUpto, @bisRenewalStatus, @bisAlarmAlert, @bisAction,
+  @iecRNo, @iecStatus, @iecModelList, @iecStandard, @iecValidityFrom, @iecValidityUpto, @iecRenewalStatus, @iecAlarmAlert, @iecAction,
+
+  NULL, NULL, NULL,
   @createdAt, @updatedAt
 );
+
 `,
       {
         id,
         sno: c.sno,
         plant: c.plant,
-        address: c.address || null,
-        rNo: c.rNo,
+        address: c.address,
         type: c.type,
-        status: c.status,
-        modelList: c.modelList || null,
-        standard: c.standard || null,
-        validityFrom: parseDateOrNull(c.validityFrom),
-        validityUpto: parseDateOrNull(c.validityUpto),
-        renewalStatus: c.renewalStatus || null,
-        alarmAlert: c.alarmAlert || null,
-        action: c.action || null,
-        attachmentName: null,
-        attachmentType: null,
-        attachmentData: null,
+
+        bisRNo: c.bisRNo,
+        bisStatus: c.bisStatus,
+        bisModelList: c.bisModelList,
+        bisStandard: c.bisStandard,
+        bisValidityFrom: c.bisValidityFrom,
+        bisValidityUpto: c.bisValidityUpto,
+        bisRenewalStatus: c.bisRenewalStatus,
+        bisAlarmAlert: c.bisAlarmAlert,
+        bisAction: c.bisAction,
+
+        iecRNo: c.iecRNo,
+        iecStatus: c.iecStatus,
+        iecModelList: c.iecModelList,
+        iecStandard: c.iecStandard,
+        iecValidityFrom: c.iecValidityFrom,
+        iecValidityUpto: c.iecValidityUpto,
+        iecRenewalStatus: c.iecRenewalStatus,
+        iecAlarmAlert: c.iecAlarmAlert,
+        iecAction: c.iecAction,
+
         createdAt: now,
         updatedAt: now,
       }
@@ -575,16 +1102,28 @@ function mapCertificationRow(r) {
     sno: Number(r.sno),
     plant: r.plant || "",
     address: r.address || "",
-    rNo: r.rNo || "",
     type: r.type || "BIS",
-    status: r.status || "Pending",
-    modelList: r.modelList || "",
-    standard: r.standard || "",
-    validityFrom: r.validityFrom ? toYMD(r.validityFrom) : "",
-    validityUpto: r.validityUpto ? toYMD(r.validityUpto) : "",
-    renewalStatus: r.renewalStatus || "",
-    alarmAlert: r.alarmAlert || "",
-    action: r.action || "",
+
+    bisRNo: r.bisRNo || "",
+    bisStatus: r.bisStatus || "",
+    bisModelList: r.bisModelList || "",
+    bisStandard: r.bisStandard || "",
+    bisValidityFrom: r.bisValidityFrom ? toYMD(r.bisValidityFrom) : "",
+    bisValidityUpto: r.bisValidityUpto ? toYMD(r.bisValidityUpto) : "",
+    bisRenewalStatus: r.bisRenewalStatus || "",
+    bisAlarmAlert: r.bisAlarmAlert || "",
+    bisAction: r.bisAction || "",
+
+    iecRNo: r.iecRNo || "",
+    iecStatus: r.iecStatus || "",
+    iecModelList: r.iecModelList || "",
+    iecStandard: r.iecStandard || "",
+    iecValidityFrom: r.iecValidityFrom ? toYMD(r.iecValidityFrom) : "",
+    iecValidityUpto: r.iecValidityUpto ? toYMD(r.iecValidityUpto) : "",
+    iecRenewalStatus: r.iecRenewalStatus || "",
+    iecAlarmAlert: r.iecAlarmAlert || "",
+    iecAction: r.iecAction || "",
+
     hasAttachment: Boolean(r.hasAttachment),
     attachmentName: r.attachmentName || "",
     attachmentType: r.attachmentType || "",
@@ -631,6 +1170,148 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+/**
+ * 🚨 ADMIN: Reset DB from Excel (DESTRUCTIVE)
+ * - Clears Certifications, EmailRecipients, EmailLogs
+ * - Seeds DEFAULT_RECIPIENTS
+ * - Imports certifications from Excel (first sheet)
+ *
+ * Security:
+ * - Requires ADMIN_RESET_TOKEN env to be set
+ * - Call with header: x-admin-token: <token>
+ */
+app.post("/api/admin/reset-from-excel", async (req, res) => {
+  try {
+    if (!ADMIN_RESET_TOKEN) {
+      return res.status(500).json({
+        error:
+          "ADMIN_RESET_TOKEN is not set on server. Refusing to run destructive reset.",
+      });
+    }
+
+    const token =
+      String(req.headers["x-admin-token"] || "").trim() ||
+      String(req.query.token || "").trim();
+
+    if (token !== ADMIN_RESET_TOKEN) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    await connectDb();
+    await ensureSchema();
+
+    const certRows = readCertificationsFromExcel(CERT_SEED_XLSX_PATH);
+
+    const now = new Date();
+    const tx = new sql.Transaction(await connectDb());
+    await tx.begin();
+
+    try {
+      // Clear everything (order matters)
+      await execSqlTx(tx, `DELETE FROM dbo.EmailLogs;`);
+      await execSqlTx(tx, `DELETE FROM dbo.Certifications;`);
+      await execSqlTx(tx, `DELETE FROM dbo.EmailRecipients;`);
+
+      // Seed recipients
+      for (const r of DEFAULT_RECIPIENTS) {
+        const id = crypto.randomUUID();
+        await execSqlTx(
+          tx,
+          `
+INSERT INTO dbo.EmailRecipients (id, name, email, role, isActive, createdAt, updatedAt)
+VALUES (@id, @name, @email, @role, @isActive, @createdAt, @updatedAt);
+          `,
+          {
+            id,
+            name: String(r.name || "").trim(),
+            email: String(r.email || "").trim(),
+            role: String(r.role || "").trim() || null,
+            isActive: true,
+            createdAt: now,
+            updatedAt: now,
+          }
+        );
+      }
+
+      // Insert certifications from Excel
+      // Insert certifications from Excel (combined BIS/IEC rows per sno)
+      for (const c of certRows) {
+        const id = crypto.randomUUID();
+        await execSqlTx(
+          tx,
+          `
+INSERT INTO dbo.Certifications (
+  id, sno, plant, address, type,
+
+  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+
+  attachmentName, attachmentType, attachmentData,
+  createdAt, updatedAt
+) VALUES (
+  @id, @sno, @plant, @address, @type,
+
+  @bisRNo, @bisStatus, @bisModelList, @bisStandard, @bisValidityFrom, @bisValidityUpto, @bisRenewalStatus, @bisAlarmAlert, @bisAction,
+  @iecRNo, @iecStatus, @iecModelList, @iecStandard, @iecValidityFrom, @iecValidityUpto, @iecRenewalStatus, @iecAlarmAlert, @iecAction,
+
+  NULL, NULL, NULL,
+  @createdAt, @updatedAt
+);
+    `,
+          {
+            id,
+            sno: c.sno,
+            plant: c.plant,
+            address: c.address || null,
+            type: c.type,
+
+            bisRNo: c.bisRNo || null,
+            bisStatus: c.bisStatus || null,
+            bisModelList: c.bisModelList || null,
+            bisStandard: c.bisStandard || null,
+            bisValidityFrom: c.bisValidityFrom || null,
+            bisValidityUpto: c.bisValidityUpto || null,
+            bisRenewalStatus: c.bisRenewalStatus || null,
+            bisAlarmAlert: c.bisAlarmAlert || null,
+            bisAction: c.bisAction || null,
+
+            iecRNo: c.iecRNo || null,
+            iecStatus: c.iecStatus || null,
+            iecModelList: c.iecModelList || null,
+            iecStandard: c.iecStandard || null,
+            iecValidityFrom: c.iecValidityFrom || null,
+            iecValidityUpto: c.iecValidityUpto || null,
+            iecRenewalStatus: c.iecRenewalStatus || null,
+            iecAlarmAlert: c.iecAlarmAlert || null,
+            iecAction: c.iecAction || null,
+
+            createdAt: now,
+            updatedAt: now,
+          }
+        );
+      }
+
+      await tx.commit();
+
+      res.json({
+        ok: true,
+        excelPath: CERT_SEED_XLSX_PATH,
+        inserted: {
+          recipients: DEFAULT_RECIPIENTS.length,
+          certifications: certRows.length,
+        },
+        note: "All data cleared and re-seeded from Excel + default recipients successfully.",
+      });
+    } catch (e) {
+      await tx.rollback();
+      throw e;
+    }
+  } catch (e) {
+    console.error("[admin reset-from-excel] failed:", e);
+    res.status(e?.status || 500).json({ error: String(e?.message || e) });
+  }
+});
+
 /* ---- Certifications CRUD ---- */
 
 app.get("/api/certifications", async (req, res) => {
@@ -644,28 +1325,41 @@ app.get("/api/certifications", async (req, res) => {
     const bind = {};
 
     if (status) {
-      where += " AND status = @status";
+      where +=
+        " AND (bisStatus = @status OR iecStatus = @status OR status = @status)";
       bind.status = status;
     }
 
     if (q) {
-      where +=
-        " AND (LOWER(plant) LIKE @q OR LOWER(rNo) LIKE @q OR LOWER(type) LIKE @q OR LOWER(status) LIKE @q)";
+      where += `
+AND (
+  LOWER(plant) LIKE @q
+  OR LOWER(ISNULL(bisRNo,'')) LIKE @q
+  OR LOWER(ISNULL(iecRNo,'')) LIKE @q
+  OR LOWER(ISNULL(rNo,'')) LIKE @q
+  OR LOWER(type) LIKE @q
+  OR LOWER(ISNULL(bisStatus,'')) LIKE @q
+  OR LOWER(ISNULL(iecStatus,'')) LIKE @q
+  OR LOWER(ISNULL(status,'')) LIKE @q
+)`;
       bind.q = `%${q}%`;
     }
 
     const out = await execSql(
       `
-SELECT
-  id, sno, plant, address, rNo, type, status, modelList, standard,
-  validityFrom, validityUpto, renewalStatus, alarmAlert, action,
-  attachmentName, attachmentType,
-  CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
-  createdAt, updatedAt
-FROM dbo.Certifications
-WHERE ${where}
-ORDER BY sno ASC, createdAt ASC;
-`,
+    SELECT
+      id, sno, plant, address, type,
+    
+      bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+      iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+    
+      attachmentName, attachmentType,
+      CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
+      createdAt, updatedAt
+    FROM dbo.Certifications
+    WHERE ${where}
+    ORDER BY sno ASC, createdAt ASC;
+    `,
       bind
     );
 
@@ -678,24 +1372,30 @@ ORDER BY sno ASC, createdAt ASC;
 
 app.get("/api/certifications/:id", async (req, res) => {
   try {
-    const id = String(req.params.id || "");
+    const id = String(req.params.id || "").trim();
+
     const out = await execSql(
       `
 SELECT TOP 1
-  id, sno, plant, address, rNo, type, status, modelList, standard,
-  validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+  id, sno, plant, address, type,
+
+  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+
   attachmentName, attachmentType,
   CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
   createdAt, updatedAt
 FROM dbo.Certifications
 WHERE id = @id;
-`,
+      `,
       { id }
     );
+
     const row = out.recordset?.[0];
     if (!row) return res.status(404).json({ error: "Not found" });
     res.json(mapCertificationRow(row));
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "Failed to load certification" });
   }
 });
@@ -801,54 +1501,94 @@ app.post("/api/certifications", async (req, res) => {
     const now = new Date();
     const id = asGuid(body.id);
 
-    const cert = {
-      id,
-      sno: Number(body.sno || 0),
-      plant: String(body.plant || "").trim(),
-      address: String(body.address || ""),
-      rNo: String(body.rNo || "").trim(),
-      type: String(body.type || "BIS"),
-      status: String(body.status || "Pending"),
-      modelList: String(body.modelList || ""),
-      standard: String(body.standard || ""),
-      validityFrom: parseDateOrNull(body.validityFrom),
-      validityUpto: parseDateOrNull(body.validityUpto),
-      renewalStatus: String(body.renewalStatus || ""),
-      alarmAlert: String(body.alarmAlert || ""),
-      action: String(body.action || ""),
-    };
+    const typeKey = normalizeCertType(body.type || "BIS");
 
-    if (!cert.plant || !cert.rNo) {
+    if (!base.plant || !base.rNo) {
       return res.status(400).json({ error: "plant and rNo are required" });
     }
+
+    // map single-row inputs into BIS/IEC columns (minimal compatibility)
+    const bis = typeKey.includes("IEC")
+      ? {}
+      : {
+          bisRNo: base.rNo,
+          bisStatus: base.status,
+          bisModelList: base.modelList,
+          bisStandard: base.standard,
+          bisValidityFrom: base.validityFrom,
+          bisValidityUpto: base.validityUpto,
+          bisRenewalStatus: base.renewalStatus,
+          bisAlarmAlert: base.alarmAlert,
+          bisAction: base.action,
+        };
+
+    const iec = typeKey.includes("IEC")
+      ? {
+          iecRNo: base.rNo,
+          iecStatus: base.status,
+          iecModelList: base.modelList,
+          iecStandard: base.standard,
+          iecValidityFrom: base.validityFrom,
+          iecValidityUpto: base.validityUpto,
+          iecRenewalStatus: base.renewalStatus,
+          iecAlarmAlert: base.alarmAlert,
+          iecAction: base.action,
+        }
+      : {};
 
     const parsedAtt = parseAttachmentFromBody(body);
 
     await execSql(
       `
 INSERT INTO dbo.Certifications (
-  id, sno, plant, address, rNo, type, status, modelList, standard,
-  validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+  id, sno, plant, address, type,
+
+  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+
   attachmentName, attachmentType, attachmentData,
   createdAt, updatedAt
 ) VALUES (
-  @id, @sno, @plant, @address, @rNo, @type, @status, @modelList, @standard,
-  @validityFrom, @validityUpto, @renewalStatus, @alarmAlert, @action,
+  @id, @sno, @plant, @address, @type,
+
+  @bisRNo, @bisStatus, @bisModelList, @bisStandard, @bisValidityFrom, @bisValidityUpto, @bisRenewalStatus, @bisAlarmAlert, @bisAction,
+  @iecRNo, @iecStatus, @iecModelList, @iecStandard, @iecValidityFrom, @iecValidityUpto, @iecRenewalStatus, @iecAlarmAlert, @iecAction,
+
   @attachmentName, @attachmentType, @attachmentData,
   @createdAt, @updatedAt
 );
-`,
+      `,
       {
-        ...cert,
-        address: cert.address || null,
-        modelList: cert.modelList || null,
-        standard: cert.standard || null,
-        renewalStatus: cert.renewalStatus || null,
-        alarmAlert: cert.alarmAlert || null,
-        action: cert.action || null,
+        id,
+        sno: base.sno,
+        plant: base.plant,
+        address: base.address || null,
+        type: base.type,
+
+        bisRNo: bis.bisRNo || null,
+        bisStatus: bis.bisStatus || null,
+        bisModelList: bis.bisModelList || null,
+        bisStandard: bis.bisStandard || null,
+        bisValidityFrom: bis.bisValidityFrom || null,
+        bisValidityUpto: bis.bisValidityUpto || null,
+        bisRenewalStatus: bis.bisRenewalStatus || null,
+        bisAlarmAlert: bis.bisAlarmAlert || null,
+        bisAction: bis.bisAction || null,
+
+        iecRNo: iec.iecRNo || null,
+        iecStatus: iec.iecStatus || null,
+        iecModelList: iec.iecModelList || null,
+        iecStandard: iec.iecStandard || null,
+        iecValidityFrom: iec.iecValidityFrom || null,
+        iecValidityUpto: iec.iecValidityUpto || null,
+        iecRenewalStatus: iec.iecRenewalStatus || null,
+        iecAlarmAlert: iec.iecAlarmAlert || null,
+        iecAction: iec.iecAction || null,
+
         attachmentName: parsedAtt.name || null,
         attachmentType: parsedAtt.type || null,
         attachmentData: parsedAtt.data || null,
+
         createdAt: now,
         updatedAt: now,
       }
@@ -857,14 +1597,17 @@ INSERT INTO dbo.Certifications (
     const out = await execSql(
       `
 SELECT TOP 1
-  id, sno, plant, address, rNo, type, status, modelList, standard,
-  validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+  id, sno, plant, address, type,
+
+  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+
   attachmentName, attachmentType,
   CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
   createdAt, updatedAt
 FROM dbo.Certifications
 WHERE id = @id;
-`,
+      `,
       { id }
     );
 
@@ -890,16 +1633,26 @@ app.put("/api/certifications/:id", async (req, res) => {
       "sno",
       "plant",
       "address",
-      "rNo",
       "type",
-      "status",
-      "modelList",
-      "standard",
-      "validityFrom",
-      "validityUpto",
-      "renewalStatus",
-      "alarmAlert",
-      "action",
+
+      "bisRNo",
+      "bisStatus",
+      "bisModelList",
+      "bisStandard",
+      "bisValidityFrom",
+      "bisValidityUpto",
+      "bisRenewalStatus",
+      "bisAlarmAlert",
+      "bisAction",
+      "iecRNo",
+      "iecStatus",
+      "iecModelList",
+      "iecStandard",
+      "iecValidityFrom",
+      "iecValidityUpto",
+      "iecRenewalStatus",
+      "iecAlarmAlert",
+      "iecAction",
     ];
 
     const sets = [];
@@ -907,11 +1660,19 @@ app.put("/api/certifications/:id", async (req, res) => {
 
     for (const k of allowed) {
       if (!(k in body)) continue;
-      if (k === "validityFrom" || k === "validityUpto") {
+
+      if (isDateKey(k)) {
         sets.push(`${k} = @${k}`);
         bind[k] = parseDateOrNull(body[k]);
         continue;
       }
+
+      if (k === "type") {
+        sets.push(`${k} = @${k}`);
+        bind[k] = normalizeCertType(body[k]);
+        continue;
+      }
+
       sets.push(`${k} = @${k}`);
       bind[k] = body[k];
     }
@@ -954,14 +1715,17 @@ WHERE id = @id;
     const out = await execSql(
       `
 SELECT TOP 1
-  id, sno, plant, address, rNo, type, status, modelList, standard,
-  validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+  id, sno, plant, address, type,
+
+  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+
   attachmentName, attachmentType,
   CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
   createdAt, updatedAt
 FROM dbo.Certifications
 WHERE id = @id;
-`,
+      `,
       { id }
     );
 
@@ -1465,7 +2229,7 @@ ORDER BY sentAt DESC;
   return Boolean(out.recordset?.[0]?.id);
 }
 
-async function hasSentOverdueToday(certId, recipientEmail) {
+async function hasSentOverdueToday(certId, recipientEmail, overdueMilestone) {
   const out = await execSql(
     `
 SELECT TOP 1 sentAt
@@ -1473,22 +2237,20 @@ FROM dbo.EmailLogs
 WHERE certificationId = @certificationId
   AND recipientEmail = @recipientEmail
   AND emailType = 'overdue'
+  AND milestone = @milestone
+  AND status = 'sent'
 ORDER BY sentAt DESC;
 `,
-    { certificationId: certId, recipientEmail }
+    { certificationId: certId, recipientEmail, milestone: overdueMilestone }
   );
 
-  const row = out.recordset?.[0];
-  if (!row || !row.sentAt) return false;
+  const sentAt = out.recordset?.[0]?.sentAt;
+  if (!sentAt) return false;
 
-  // compare IST date portions
-  const last = new Date(row.sentAt);
-  const lastIst = new Date(last.getTime() + 330 * 60 * 1000);
-  const y = String(lastIst.getUTCFullYear()).padStart(4, "0");
-  const m = String(lastIst.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(lastIst.getUTCDate()).padStart(2, "0");
-  const lastYmd = `${y}-${m}-${d}`;
-  return lastYmd === todayYmdIST();
+  // Compare by IST day (same logic you use elsewhere)
+  const lastYmd = toYMD(new Date(sentAt.getTime() + 330 * 60 * 1000));
+  const todayYmd = todayYmdIST();
+  return lastYmd === todayYmd;
 }
 
 async function addEmailLogRow({
@@ -1530,71 +2292,141 @@ async function runNotificationJob() {
   let sent = 0;
   let skipped = 0;
 
-  for (const cert of certs) {
-    const status = getExpiryStatus(cert.validityUpto);
-    if (status === "safe") {
+  // Expand a combined row into "virtual" BIS and/or IEC rows so all existing
+  // email builder logic can keep using: rNo, status, validityFrom, validityUpto...
+  function expandCert(row) {
+    const out = [];
+
+    const hasBIS =
+      Boolean(row.bisRNo) ||
+      Boolean(row.bisValidityUpto) ||
+      Boolean(row.bisValidityFrom) ||
+      Boolean(row.bisStatus);
+
+    const hasIEC =
+      Boolean(row.iecRNo) ||
+      Boolean(row.iecValidityUpto) ||
+      Boolean(row.iecValidityFrom) ||
+      Boolean(row.iecStatus);
+
+    if (hasBIS) {
+      out.push({
+        ...row,
+        type: "BIS",
+        rNo: row.bisRNo || "",
+        status: row.bisStatus || "",
+        modelList: row.bisModelList || "",
+        standard: row.bisStandard || "",
+        validityFrom: row.bisValidityFrom || "",
+        validityUpto: row.bisValidityUpto || "",
+        renewalStatus: row.bisRenewalStatus || "",
+        alarmAlert: row.bisAlarmAlert || "",
+        action: row.bisAction || "",
+        _typeKey: "BIS",
+      });
+    }
+
+    if (hasIEC) {
+      out.push({
+        ...row,
+        type: "IEC",
+        rNo: row.iecRNo || "",
+        status: row.iecStatus || "",
+        modelList: row.iecModelList || "",
+        standard: row.iecStandard || "",
+        validityFrom: row.iecValidityFrom || "",
+        validityUpto: row.iecValidityUpto || "",
+        renewalStatus: row.iecRenewalStatus || "",
+        alarmAlert: row.iecAlarmAlert || "",
+        action: row.iecAction || "",
+        _typeKey: "IEC",
+      });
+    }
+
+    // If neither has data (unlikely), treat as skip.
+    return out;
+  }
+
+  for (const parent of certs) {
+    const virtuals = expandCert(parent);
+    if (!virtuals.length) {
       skipped += 1;
       continue;
     }
 
-    const isOverdue = status === "overdue";
-    const milestone = isOverdue ? "overdue" : status;
-
-    // Determine per-recipient needs
-    const toSend = [];
-    for (const r of recipients) {
-      if (isOverdue) {
-        const already = await hasSentOverdueToday(cert.id, r.email);
-        if (!already) toSend.push(r);
-      } else {
-        const already = await hasSentMilestone(cert.id, r.email, milestone);
-        if (!already) toSend.push(r);
+    for (const cert of virtuals) {
+      const status = getExpiryStatus(cert.validityUpto);
+      if (status === "safe") {
+        skipped += 1;
+        continue;
       }
-    }
 
-    if (!toSend.length) {
-      skipped += 1;
-      continue;
-    }
+      const isOverdue = status === "overdue";
+      const milestoneBase = isOverdue ? "overdue" : status;
+      const milestone = `${cert._typeKey}:${milestoneBase}`;
 
-    const subject = isOverdue
-      ? `🚨 OVERDUE: ${cert.plant} ${cert.type} Certification Has Expired`
-      : `⚠️ REMINDER: ${cert.plant} ${
-          cert.type
-        } Certification - ${milestoneLabel(status)}`;
-
-    const html = buildEmailHtml(cert, status);
-
-    try {
-      await sendEmail(
-        toSend.map((x) => x.email),
-        subject,
-        html,
-        []
-      );
-      for (const r of toSend) {
-        await addEmailLogRow({
-          certificationId: cert.id,
-          recipientEmail: r.email,
-          emailType: isOverdue ? "overdue" : "reminder",
-          milestone,
-          status: "sent",
-          error: null,
-        });
+      // Determine per-recipient needs
+      const toSend = [];
+      for (const r of recipients) {
+        if (isOverdue) {
+          // NOTE: update signature: hasSentOverdueToday(certId, email, milestone)
+          const already = await hasSentOverdueToday(
+            cert.id,
+            r.email,
+            milestone
+          );
+          if (!already) toSend.push(r);
+        } else {
+          const already = await hasSentMilestone(cert.id, r.email, milestone);
+          if (!already) toSend.push(r);
+        }
       }
-      sent += 1;
-    } catch (e) {
-      for (const r of toSend) {
-        await addEmailLogRow({
-          certificationId: cert.id,
-          recipientEmail: r.email,
-          emailType: isOverdue ? "overdue" : "reminder",
-          milestone,
-          status: "failed",
-          error: String(e?.message || e),
-        });
+
+      if (!toSend.length) {
+        skipped += 1;
+        continue;
       }
-      console.error("[notify] send failed:", e);
+
+      const subject = isOverdue
+        ? `🚨 OVERDUE: ${cert.plant} ${cert.type} Certification Has Expired`
+        : `⚠️ REMINDER: ${cert.plant} ${
+            cert.type
+          } Certification - ${milestoneLabel(status)}`;
+
+      const html = buildEmailHtml(cert, status);
+
+      try {
+        await sendEmail(
+          toSend.map((x) => x.email),
+          subject,
+          html,
+          []
+        );
+
+        for (const r of toSend) {
+          await addEmailLogRow({
+            certificationId: cert.id,
+            recipientEmail: r.email,
+            emailType: isOverdue ? "overdue" : "reminder",
+            milestone,
+            status: "sent",
+            error: null,
+          });
+        }
+        sent += 1;
+      } catch (e) {
+        for (const r of toSend) {
+          await addEmailLogRow({
+            certificationId: cert.id,
+            recipientEmail: r.email,
+            emailType: isOverdue ? "overdue" : "reminder",
+            milestone,
+            status: "failed",
+            error: String(e?.message || e),
+          });
+        }
+        console.error("[notify] send failed:", e);
+      }
     }
   }
 
