@@ -1,3 +1,4 @@
+// src/components/CertificationTable.tsx
 import { Fragment, useMemo, useState } from "react";
 import {
   Table,
@@ -39,13 +40,21 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
-
 import { toast } from "sonner";
+
+interface SoftDeletePayload {
+  reason: string;
+  proof: {
+    name: string;
+    type: string;
+    base64: string;
+  };
+}
 
 interface CertificationTableProps {
   certifications: Certification[];
   onEdit: (cert: Certification) => void;
-  onDelete: (id: string) => Promise<void>;
+  onDelete: (id: string, payload: SoftDeletePayload) => Promise<void>;
   onView: (cert: Certification) => void;
 }
 
@@ -58,6 +67,22 @@ export const CertificationTable = ({
   const [searchQuery, setSearchQuery] = useState("");
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  const [deleteReason, setDeleteReason] = useState("");
+  const [deleteProofFile, setDeleteProofFile] = useState<File | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  async function fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.onload = () => {
+        const res = String(reader.result || "");
+        const base64 = res.includes(",") ? res.split(",")[1] : "";
+        resolve(base64);
+      };
+      reader.readAsDataURL(file);
+    });
+  }
 
   const safeCerts = Array.isArray(certifications) ? certifications : [];
 
@@ -107,9 +132,8 @@ export const CertificationTable = ({
     for (const c of filteredCerts) {
       const key = `${c.sno}||${c.plant}||${c.address}`;
       const existing = map.get(key);
-      if (existing) {
-        existing.items.push(c);
-      } else {
+      if (existing) existing.items.push(c);
+      else {
         map.set(key, {
           key,
           sno: c.sno,
@@ -120,7 +144,6 @@ export const CertificationTable = ({
       }
     }
 
-    // stable sort: by S.No and then type
     const sortType = (t: string) => (t === "BIS" ? 0 : t === "IEC" ? 1 : 2);
 
     return Array.from(map.values())
@@ -158,12 +181,10 @@ export const CertificationTable = ({
       };
     }
 
-    // Fallback for older combined-row schema
     const t = (cert.type || "BIS") as any;
     const isBIS = t === "BIS";
     const isIEC = t === "IEC";
 
-    // if old combined row (BIS & IEC), we keep it as-is (handled by old UI branches)
     if (t === "BIS & IEC") {
       return {
         type: t,
@@ -201,8 +222,6 @@ export const CertificationTable = ({
 
   const getModelSummary = (cert: Certification) => {
     const eff = getEffectiveFields(cert);
-
-    // Combined old row => choose first available
     const raw =
       cert.type === "BIS & IEC"
         ? cert.bisModelList || cert.iecModelList || ""
@@ -218,13 +237,47 @@ export const CertificationTable = ({
 
   const handleDelete = async () => {
     if (!deleteId) return;
+
+    const reason = String(deleteReason || "").trim();
+    if (!reason) {
+      toast.error("Please provide a deletion reason.");
+      return;
+    }
+    if (!deleteProofFile) {
+      toast.error("Please attach proof for deletion.");
+      return;
+    }
+
+    // Optional guard (helps avoid huge payloads)
+    const maxBytes = 8 * 1024 * 1024; // 8MB
+    if (deleteProofFile.size > maxBytes) {
+      toast.error("Proof file is too large (max 8MB).");
+      return;
+    }
+
+    setDeleteBusy(true);
     try {
-      await onDelete(deleteId);
-      toast.success("Certification deleted");
-    } catch {
-      toast.error("Failed to delete certification");
+      const base64 = await fileToBase64(deleteProofFile);
+
+      await onDelete(deleteId, {
+        reason,
+        proof: {
+          name: deleteProofFile.name,
+          type: deleteProofFile.type || "application/octet-stream",
+          base64,
+        },
+      });
+
+      toast.success("Certification deleted (soft)");
+    } catch (e: any) {
+      toast.error(
+        e?.message ? String(e.message) : "Failed to delete certification"
+      );
     } finally {
+      setDeleteBusy(false);
       setDeleteId(null);
+      setDeleteReason("");
+      setDeleteProofFile(null);
     }
   };
 
@@ -270,15 +323,10 @@ export const CertificationTable = ({
     return <StatusBadge status={(eff.status as any) || "Pending"} />;
   };
 
-  const pickValidityFrom = (cert: Certification) => {
-    const eff = getEffectiveFields(cert);
-    return eff.validityFrom || "";
-  };
-
-  const pickValidityUpto = (cert: Certification) => {
-    const eff = getEffectiveFields(cert);
-    return eff.validityUpto || "";
-  };
+  const pickValidityFrom = (cert: Certification) =>
+    getEffectiveFields(cert).validityFrom || "";
+  const pickValidityUpto = (cert: Certification) =>
+    getEffectiveFields(cert).validityUpto || "";
 
   const renderValidityFromCell = (cert: Certification) => {
     if (cert.type === "BIS & IEC") {
@@ -350,7 +398,6 @@ export const CertificationTable = ({
   };
 
   const renderAllDetailsCell = (cert: Certification) => {
-    // New row-wise record -> show compact single-line details
     const eff = getEffectiveFields(cert);
     const hasLegacy =
       Boolean((cert as any).rNo) ||
@@ -381,7 +428,6 @@ export const CertificationTable = ({
       );
     }
 
-    // Fallback: old combined-row UI
     const lines: string[] = [];
 
     if (cert.bisRNo || cert.type === "BIS" || cert.type === "BIS & IEC") {
@@ -454,7 +500,6 @@ export const CertificationTable = ({
               <TableHead>Validity Upto</TableHead>
               <TableHead>Expiry Alert</TableHead>
               <TableHead>All Details</TableHead>
-
               <TableHead className="w-12"></TableHead>
             </TableRow>
           </TableHeader>
@@ -473,17 +518,18 @@ export const CertificationTable = ({
               </TableRow>
             ) : (
               groupedCerts.map((group, gIndex) => {
-                const isOpen = openGroups[group.key] ?? true; // default open
+                const isOpen = openGroups[group.key] ?? true;
+
+                // ✅ fixed counts for legacy "BIS & IEC" rows
                 const bisCount = group.items.filter(
-                  (x) => x.type === "BIS"
+                  (x) => x.type === "BIS" || x.type === "BIS & IEC"
                 ).length;
                 const iecCount = group.items.filter(
-                  (x) => x.type === "IEC"
+                  (x) => x.type === "IEC" || x.type === "BIS & IEC"
                 ).length;
 
                 return (
                   <Fragment key={group.key}>
-                    {/* Parent row (Plant) */}
                     <TableRow
                       className="bg-muted/40"
                       style={{ animationDelay: `${gIndex * 50}ms` }}
@@ -533,7 +579,6 @@ export const CertificationTable = ({
                       </TableCell>
                     </TableRow>
 
-                    {/* Children rows (BIS/IEC entries) */}
                     {isOpen
                       ? group.items.map((cert, index) => (
                           <TableRow
@@ -543,12 +588,10 @@ export const CertificationTable = ({
                               animationDelay: `${(gIndex * 10 + index) * 30}ms`,
                             }}
                           >
-                            {/* S.No */}
                             <TableCell className="text-muted-foreground">
                               {" "}
                             </TableCell>
 
-                            {/* Plant column -> show model summary instead */}
                             <TableCell>
                               <div className="font-medium">
                                 {getModelSummary(cert)}
@@ -556,7 +599,9 @@ export const CertificationTable = ({
                               <div className="text-xs text-muted-foreground">
                                 {cert.type === "BIS"
                                   ? "BIS entry"
-                                  : "IEC entry"}
+                                  : cert.type === "IEC"
+                                  ? "IEC entry"
+                                  : "Combined entry"}
                               </div>
                             </TableCell>
 
@@ -630,23 +675,69 @@ export const CertificationTable = ({
         </Table>
       </div>
 
-      <AlertDialog open={!!deleteId} onOpenChange={() => setDeleteId(null)}>
+      <AlertDialog
+        open={!!deleteId}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDeleteId(null);
+            setDeleteReason("");
+            setDeleteProofFile(null);
+            setDeleteBusy(false);
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Certification</AlertDialogTitle>
+            <AlertDialogTitle>
+              Delete Certification (Soft Delete)
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete this certification and stop all
-              related email notifications. This action cannot be undone.
+              This will soft-delete the certification (it will be hidden from
+              the main list and excluded from notifications). Please provide a
+              reason and attach proof.
             </AlertDialogDescription>
           </AlertDialogHeader>
 
+          <div className="space-y-4 pt-2">
+            <div className="space-y-2">
+              <div className="text-sm font-medium">Reason (required)</div>
+              <Input
+                placeholder="Reason for deletion..."
+                value={deleteReason}
+                onChange={(e) => setDeleteReason(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="text-sm font-medium">
+                Proof Attachment (required)
+              </div>
+              <Input
+                type="file"
+                accept=".pdf,image/*"
+                onChange={(e) =>
+                  setDeleteProofFile(e.target.files?.[0] || null)
+                }
+              />
+              {deleteProofFile ? (
+                <div className="text-xs text-muted-foreground">
+                  Selected:{" "}
+                  <span className="font-medium">{deleteProofFile.name}</span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleteBusy}>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDelete}
+              disabled={
+                deleteBusy || !String(deleteReason).trim() || !deleteProofFile
+              }
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              Delete
+              {deleteBusy ? "Deleting..." : "Delete"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
