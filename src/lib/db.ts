@@ -1,5 +1,10 @@
 // src/lib/db.ts
 // Switch from IndexedDB to Backend API (MSSQL)
+export type CertificationStatus =
+  | "Active"
+  | "Under process"
+  | "Expired"
+  | "Pending";
 
 export interface Certification {
   id: string;
@@ -10,9 +15,22 @@ export interface Certification {
   // derived overall type
   type: "BIS" | "IEC" | "BIS & IEC";
 
+  // ✅ NEW (row-wise) fields (single record == one type: BIS or IEC)
+  rNo?: string;
+  status?: CertificationStatus;
+  modelList?: string;
+  standard?: string;
+  validityFrom?: string; // YYYY-MM-DD
+  validityUpto?: string; // YYYY-MM-DD
+  renewalStatus?: string;
+  alarmAlert?: string;
+  action?: string;
+
   // BIS fields
   bisRNo?: string;
-  bisStatus?: "Active" | "Under process" | "Expired" | "Pending";
+  bisStatus?: CertificationStatus;
+
+
   bisModelList?: string;
   bisStandard?: string;
   bisValidityFrom?: string; // YYYY-MM-DD
@@ -23,7 +41,8 @@ export interface Certification {
 
   // IEC fields
   iecRNo?: string;
-  iecStatus?: "Active" | "Under process" | "Expired" | "Pending";
+  iecStatus?: CertificationStatus;
+
   iecModelList?: string;
   iecStandard?: string;
   iecValidityFrom?: string; // YYYY-MM-DD
@@ -47,13 +66,49 @@ export type CertificationAttachmentPayload = {
   base64: string; // raw base64 (no dataURL prefix)
 };
 
-export type CertificationUpsertPayload = Omit<
-  Certification,
-  "id" | "createdAt" | "updatedAt"
-> & {
+export type CertificationUpsertPayload = {
+  sno: number;
+  plant: string;
+  address?: string;
+  type: "BIS" | "IEC" | "BIS & IEC";
+
+  // ✅ row-wise fields (preferred)
+  rNo?: string;
+  status?: CertificationStatus;
+  modelList?: string;
+  standard?: string;
+  validityFrom?: string; // YYYY-MM-DD
+  validityUpto?: string; // YYYY-MM-DD
+  renewalStatus?: string;
+  alarmAlert?: string;
+  action?: string;
+
+  // ✅ legacy fields (kept for backwards compatibility / old rows)
+  bisRNo?: string;
+  bisStatus?: CertificationStatus;
+  bisModelList?: string;
+  bisStandard?: string;
+  bisValidityFrom?: string;
+  bisValidityUpto?: string;
+  bisRenewalStatus?: string;
+  bisAlarmAlert?: string;
+  bisAction?: string;
+
+  iecRNo?: string;
+  iecStatus?: CertificationStatus;
+  iecModelList?: string;
+  iecStandard?: string;
+  iecValidityFrom?: string;
+  iecValidityUpto?: string;
+  iecRenewalStatus?: string;
+  iecAlarmAlert?: string;
+  iecAction?: string;
+
   attachment?: CertificationAttachmentPayload;
   attachmentClear?: boolean;
 };
+
+
 
 export interface EmailRecipient {
   id: string;

@@ -358,19 +358,64 @@ function excelSerialToDate(n) {
   return new Date(Date.UTC(dc.y, dc.m - 1, dc.d));
 }
 
+function parseLooseDateString(s) {
+  const raw = String(s || "").trim();
+  if (!raw) return null;
+
+  // normalize multiple spaces
+  const str = raw.replace(/\s+/g, " ");
+
+  // Match dd.mm.yyyy OR dd/mm/yyyy OR mm/dd/yyyy OR dd-mm-yyyy etc.
+  const m = str.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  if (m) {
+    let a = parseInt(m[1], 10);
+    let b = parseInt(m[2], 10);
+    let y = parseInt(m[3], 10);
+    if (y < 100) y += 2000;
+
+    const sep = (str.match(/[./-]/) || ["/"])[0];
+
+    // If dot-separated, assume dd.mm.yyyy (common in your sheet)
+    let day, month;
+    if (sep === ".") {
+      day = a;
+      month = b;
+    } else {
+      // slash/hyphen: infer using >12 heuristic
+      // 12/19/2023 => month/day
+      // 31/01/2024 => day/month
+      if (b > 12 && a <= 12) {
+        month = a;
+        day = b;
+      } else if (a > 12 && b <= 12) {
+        day = a;
+        month = b;
+      } else {
+        // default to month/day (matches 7/29/2021 in your sheet)
+        month = a;
+        day = b;
+      }
+    }
+
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    return new Date(Date.UTC(y, month - 1, day));
+  }
+
+  // fallback: try native Date parse
+  const d = new Date(str);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
 function excelCellToDate(v) {
   if (!v) return null;
   if (v instanceof Date) return v;
-  if (typeof v === "number") {
-    // Many sheets store dates as numbers even when formatted as date
-    return excelSerialToDate(v);
-  }
-  // Try parsing strings (YYYY-MM-DD or similar)
+  if (typeof v === "number") return excelSerialToDate(v);
+
   const s = String(v).trim();
   if (!s) return null;
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
+
+  return parseLooseDateString(s);
 }
 
 // Excel -> certification rows (Book 96 format: BIS row has S.No, IEC row has blank S.No)
@@ -401,13 +446,16 @@ function readCertificationsFromExcel(filePath) {
   // 0 S.no, 1 Plant, 2 Address, 3 R- No, 4 Type, 5 Status, 6 Model list, 7 Standard,
   // 8 Validity From, 9 Validity Upto, 10 Renewal Status, 11 Alarm Alert, 12 Action
 
-  const map = new Map(); // sno -> combined record
+  const out = [];
+
   let lastSno = null;
+  let lastPlant = "";
+  let lastAddress = "";
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
-    const snoRaw = r[0];
 
+    const snoRaw = r[0];
     let sno =
       typeof snoRaw === "number"
         ? Math.trunc(snoRaw)
@@ -415,106 +463,71 @@ function readCertificationsFromExcel(filePath) {
         ? parseInt(String(snoRaw).trim(), 10)
         : null;
 
-    // ✅ Book 96: IEC row has blank S.No → carry forward previous S.No
+    // carry-forward like your sheet (blank sno rows)
     if (!sno && lastSno) sno = lastSno;
     if (!sno) continue;
     lastSno = sno;
 
-    const plant = cleanStr(r[1]);
-    const address = cleanStr(r[2]);
-    const rNo = cleanStr(r[3]) || "";
+    const plant = cleanStr(r[1]) || lastPlant || `Plant ${sno}`;
+    const address = cleanStr(r[2]) || lastAddress || null;
 
-    // row-level type is BIS or IEC
-    const type = normalizeCertType(cleanStr(r[4]) || "BIS");
+    if (plant) lastPlant = plant;
+    if (address) lastAddress = address;
 
-    const status = cleanStr(r[5]) || "Pending";
-    const modelList = cleanStr(r[6]);
-    const standard = cleanStr(r[7]);
+    const rNo = cleanStr(r[3]) || null;
+    const type = normalizeCertType(cleanStr(r[4]) || "BIS"); // BIS / IEC / BIS & IEC
+    const status = cleanStr(r[5]) || null;
+    const modelList = cleanStr(r[6]) || null;
+    const standard = cleanStr(r[7]) || null;
 
     const vf = excelCellToDate(r[8]) || null;
     const vu = excelCellToDate(r[9]) || null;
 
-    // Renewal Status sometimes is a date or string
     const renewalRaw = r[10];
     const renewalDate = excelCellToDate(renewalRaw);
     const renewalStatus = renewalDate
       ? toYMD(renewalDate)
-      : cleanStr(renewalRaw);
+      : cleanStr(renewalRaw) || null;
 
-    const alarmAlert = cleanStr(r[11]);
-    const action = cleanStr(r[12]);
+    const alarmAlert = cleanStr(r[11]) || null;
+    const action = cleanStr(r[12]) || null;
 
-    if (!map.has(sno)) {
-      map.set(sno, {
-        sno,
-        plant: plant || `Plant ${sno}`,
-        address: address || null,
+    // If row is completely empty except carried sno, skip
+    const hasAny =
+      Boolean(rNo) ||
+      Boolean(type) ||
+      Boolean(status) ||
+      Boolean(modelList) ||
+      Boolean(standard) ||
+      Boolean(vf) ||
+      Boolean(vu) ||
+      Boolean(renewalStatus) ||
+      Boolean(alarmAlert) ||
+      Boolean(action);
 
-        // BIS fields
-        bisRNo: null,
-        bisStatus: null,
-        bisModelList: null,
-        bisStandard: null,
-        bisValidityFrom: null,
-        bisValidityUpto: null,
-        bisRenewalStatus: null,
-        bisAlarmAlert: null,
-        bisAction: null,
+    if (!hasAny) continue;
 
-        // IEC fields
-        iecRNo: null,
-        iecStatus: null,
-        iecModelList: null,
-        iecStandard: null,
-        iecValidityFrom: null,
-        iecValidityUpto: null,
-        iecRenewalStatus: null,
-        iecAlarmAlert: null,
-        iecAction: null,
-      });
-    }
-
-    const item = map.get(sno);
-
-    // Prefer non-empty shared fields
-    if (plant && !item.plant) item.plant = plant;
-    if (address && !item.address) item.address = address;
-
-    if (type === "BIS") {
-      item.bisRNo = rNo || item.bisRNo;
-      item.bisStatus = status || item.bisStatus;
-      item.bisModelList = modelList || item.bisModelList;
-      item.bisStandard = standard || item.bisStandard;
-      item.bisValidityFrom = vf || item.bisValidityFrom;
-      item.bisValidityUpto = vu || item.bisValidityUpto;
-      item.bisRenewalStatus = renewalStatus || item.bisRenewalStatus;
-      item.bisAlarmAlert = alarmAlert || item.bisAlarmAlert;
-      item.bisAction = action || item.bisAction;
-    } else {
-      item.iecRNo = rNo || item.iecRNo;
-      item.iecStatus = status || item.iecStatus;
-      item.iecModelList = modelList || item.iecModelList;
-      item.iecStandard = standard || item.iecStandard;
-      item.iecValidityFrom = vf || item.iecValidityFrom;
-      item.iecValidityUpto = vu || item.iecValidityUpto;
-      item.iecRenewalStatus = renewalStatus || item.iecRenewalStatus;
-      item.iecAlarmAlert = alarmAlert || item.iecAlarmAlert;
-      item.iecAction = action || item.iecAction;
-    }
+    out.push({
+      sno,
+      plant,
+      address,
+      rNo,
+      type: type === "BIS & IEC" ? "BIS" : type, // sheet is row-wise; keep single type
+      status,
+      modelList,
+      standard,
+      validityFrom: vf ? toYMD(vf) : null,
+      validityUpto: vu ? toYMD(vu) : null,
+      renewalStatus,
+      alarmAlert,
+      action,
+    });
   }
 
-  const out = Array.from(map.values()).map((x) => {
-    const hasBIS = Boolean(
-      x.bisRNo || x.bisStatus || x.bisValidityUpto || x.bisValidityFrom
-    );
-    const hasIEC = Boolean(
-      x.iecRNo || x.iecStatus || x.iecValidityUpto || x.iecValidityFrom
-    );
-    x.type = hasBIS && hasIEC ? "BIS & IEC" : hasIEC ? "IEC" : "BIS";
-    return x;
-  });
-
-  out.sort((a, b) => a.sno - b.sno);
+  // stable order
+  out.sort(
+    (a, b) => a.sno - b.sno || String(a.type).localeCompare(String(b.type))
+  );
   return out;
 }
 
@@ -870,170 +883,672 @@ async function seedIfEmpty() {
   const now = new Date();
 
   const initialData = [
+    // =========================
+    // 1) PEPPL (P2)
+    // =========================
+
+    // BIS (3 rows)
     {
       sno: 1,
       plant: "PEPPL (P2)",
       address:
         "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
-      type: "BIS & IEC",
-
-      // BIS
-      bisRNo: "R-63002356",
-      bisStatus: "Active",
-      bisModelList:
-        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 550 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 550 to 525)",
-      bisStandard:
+      rNo: "R-63002356",
+      type: "BIS",
+      status: "Active",
+      modelList: "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)",
+      standard:
         "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
-      bisValidityFrom: "2021-07-29",
-      bisValidityUpto: "2023-07-28",
-      bisRenewalStatus: "46962",
-      bisAlarmAlert: "",
-      bisAction: "-",
-
-      // IEC
-      iecRNo: "ID 1111296708",
-      iecStatus: "Active",
-      iecModelList:
-        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
-      iecStandard:
-        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
-      iecValidityFrom: "2025-01-24",
-      iecValidityUpto: "2030-01-23",
-      iecRenewalStatus: null,
-      iecAlarmAlert: null,
-      iecAction: null,
+      validityFrom: "2021-07-29",
+      validityUpto: "2023-07-28",
+      renewalStatus: "46962",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "R-63002356",
+      type: "BIS",
+      status: "Active",
+      modelList: "Perc Transparent BS M10: PE-XXXHB(where xxx- 550 to 525)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2021-07-29",
+      validityUpto: "2023-07-28",
+      renewalStatus: "46962",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "R-63002356",
+      type: "BIS",
+      status: "Active",
+      modelList: "Perc Dual Glass M10: PE-XXXHGB(where xxx- 550 to 525)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2021-07-29",
+      validityUpto: "2023-07-28",
+      renewalStatus: "46962",
+      alarmAlert: "",
+      action: "",
     },
 
+    // IEC (6 rows)
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "4478021406749-182R2M1",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)",
+      standard:
+        "IEC/EN 61215:2016,IEC/EN 61215-1-1:2016,IEC 61215-2:2016,/EN 61215-2:2017+AC:2017+AC:2018,\nIEC 61730-1:2016/EN IEC 61730-1:2018+AC:2018,\nIEC 61730-2:2016/EN IEC 61730-2:2018+AC:2018",
+      validityFrom: "2022-01-12",
+      validityUpto: "2026-08-26",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "ID 1111261827",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)",
+      standard:
+        "IEC 61215-1:2021,IEC 61215-1-1:2021, IEC 61215-2:2021\nIEC 61730-1:2016, IEC 61730-2:2016",
+      validityFrom: "2024-01-31",
+      validityUpto: "2027-11-20",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "PERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 1,
+      plant: "PEPPL (P2)",
+      address:
+        "PLOT NO 8/B/1 AND 8/B/2, SY NO 62 P 63 P AND 88 P, E CITY, RAVIRYALA VILLAGE, MAHESHWARAM MANDAL, RANGA REDDY, TELANGANA, 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+
+    // =========================
+    // 2) PEIPL (P4)
+    // =========================
     {
       sno: 2,
       plant: "PEIPL (P4)",
       address:
         "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
-      type: "BIS & IEC",
-
-      // BIS
-      bisRNo: "R-63003719",
-      bisStatus: "Under process",
-      bisModelList:
-        "Perc Transparent M10: PEI-144-xxxHB-M10 (where xxx- 555 to 525)\nPerc Dual Glass M10: PEI-144-xxxHGB-M10 (where xxx- 555 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
-      bisStandard:
+      rNo: "R-63003719",
+      type: "BIS",
+      status: "Inactive",
+      modelList:
+        "Perc Transparent M10: PEI-144-xxxHB-M10 (where xxx- 555 to 525)",
+      standard:
         "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
-      bisValidityFrom: "2023-12-19",
-      bisValidityUpto: "2025-12-18",
-      bisRenewalStatus: "",
-      bisAlarmAlert: "Start Certification",
-      bisAction:
+      validityFrom: "2023-12-19",
+      validityUpto: "2025-12-18",
+      renewalStatus: "",
+      alarmAlert: "Start Certification",
+      action:
         "Samples are already submitted. Expected BIS certification by W3 of Jan'26",
-
-      // IEC (same IEC block shown)
-      iecRNo: "ID 1111296708",
-      iecStatus: "Active",
-      iecModelList:
-        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
-      iecStandard:
-        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
-      iecValidityFrom: "2025-01-24",
-      iecValidityUpto: "2030-01-23",
-      iecRenewalStatus: null,
-      iecAlarmAlert: null,
-      iecAction: null,
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "R-63003719",
+      type: "BIS",
+      status: "Inactive",
+      modelList:
+        "Perc Dual Glass M10: PEI-144-xxxHGB-M10 (where xxx- 555 to 525)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2023-12-19",
+      validityUpto: "2025-12-18",
+      renewalStatus: "",
+      alarmAlert: "Start Certification",
+      action: "Confirm if sample planning is required",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "R-63003719",
+      type: "BIS",
+      status: "Under process",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2023-12-19",
+      validityUpto: "2025-12-18",
+      renewalStatus: "",
+      alarmAlert: "Start Certification",
+      action: "Confirm if sample planning is required",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "R-63003719",
+      type: "BIS",
+      status: "Inactive",
+      modelList:
+        "PERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2023-12-19",
+      validityUpto: "2025-12-18",
+      renewalStatus: "",
+      alarmAlert: "Start Certification",
+      action: "Confirm if sample planning is required",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "R-63003719",
+      type: "BIS",
+      status: "Inactive",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2023-12-19",
+      validityUpto: "2025-12-18",
+      renewalStatus: "",
+      alarmAlert: "Start Certification",
+      action: "Confirm if sample planning is required",
     },
 
+    // IEC (P4)
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "ID 1111261827",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)",
+      standard:
+        "IEC 61215-1-1: 2021 & IS/IEC 61730-1: 2016 & IS/IEC 61730-2: 2016",
+      validityFrom: "2024-01-31",
+      validityUpto: "2027-11-20",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "PERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 2,
+      plant: "PEIPL (P4)",
+      address:
+        "PLOT NOS. S-95, S-96, S-100, S-101, S-102, S-103 & S-104, RAVIRYALA, RAVIRYAL(V),MAHESWARAM(M), RANGAREDDY(D)- 501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+
+    // =========================
+    // 3) PEGEPL(P5)
+    // =========================
     {
       sno: 3,
       plant: "PEGEPL(P5)",
       address:
         "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
-      type: "BIS & IEC",
-
-      // BIS
-      bisRNo: "R-63004740",
-      bisStatus: "Active",
-      bisModelList:
-        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)\nTopCON Dual Glass G12: PE-132-xxxTHGB-G12 (where xxx-680 to 710)",
-      bisStandard:
+      rNo: "R-63004740",
+      type: "BIS",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
         "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
-      bisValidityFrom: "2025-01-21",
-      bisValidityUpto: "2027-01-09",
-      bisRenewalStatus: "",
-      bisAlarmAlert: "",
-      bisAction: "-",
-
-      // IEC
-      iecRNo: "ID 1111296708",
-      iecStatus: "Active",
-      iecModelList:
-        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
-      iecStandard:
-        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
-      iecValidityFrom: "2025-01-24",
-      iecValidityUpto: "2030-01-23",
-      iecRenewalStatus: null,
-      iecAlarmAlert: null,
-      iecAction: null,
+      validityFrom: "2025-01-21",
+      validityUpto: "2027-01-09",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      rNo: "R-63004740",
+      type: "BIS",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2025-01-21",
+      validityUpto: "2027-01-09",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      rNo: "R-63004740",
+      type: "BIS",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass G12: PE-132-xxxTHGB-G12 (where xxx-680 to 710)",
+      standard:
+        "IS 14286 : 2010/ IEC 61215 : 2005, IS/IEC 61730 (PART 1) : 2004 & IS/IEC 61730 (PART 2) : 2004",
+      validityFrom: "2025-01-21",
+      validityUpto: "2027-01-09",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
     },
 
+    // IEC (P5) (4 rows)
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "PERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 3,
+      plant: "PEGEPL(P5)",
+      address:
+        "S-95,S-96,S-100,S-101,S-102,S-103 AND S-104/ PART 1, E CITY,RAVIRYALA,MAHESWARAM, MAHESWARAM,RANGAREDDY-501359 TELANGANA,India-501359",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+
+    // =========================
+    // 4) PEGEPL(P6)
+    // =========================
     {
       sno: 4,
       plant: "PEGEPL(P6)",
       address: "303, 304, 305 AND 306/2, IALA-MAHESWARAM, RANGAREDDY",
-      type: "BIS & IEC",
-
-      // BIS
-      bisRNo: "R-63005460",
-      bisStatus: "Active",
-      bisModelList:
+      rNo: "R-63005460",
+      type: "BIS",
+      status: "Active",
+      modelList:
         "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
-      bisStandard:
+      standard:
         "IS 14286 (PART 1/SEC 1) : 2023/ IEC 61215-1-1: 2021 & IS/IEC 61730-1: 2016 & IS/IEC 61730-2: 2016",
-      bisValidityFrom: "2025-12-11",
-      bisValidityUpto: "2027-12-10",
-      bisRenewalStatus: "",
-      bisAlarmAlert: "",
-      bisAction: "-",
-
-      // IEC
-      iecRNo: "ID 1111296708",
-      iecStatus: "Active",
-      iecModelList:
-        "Perc Monofacial M10: PE-XXXHM(where xxx- 555 to 520)\nPerc Transparent BS M10: PE-XXXHB(where xxx- 555 to 525)\nPerc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)\nTopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)\nPERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)\nTopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
-      iecStandard:
-        "IEC 61215-1:2021\nIEC 61215-1-1:2021\nIEC 61215-2:2021\nIEC 61730-1:2023\nIEC 61730-2:2023\nEN IEC 61215-1:2021\nEN IEC 61215-1-1:2021\nEN IEC 61215-2:2021\nEN IEC 61730-1:2018\nEN IEC 61730-2:2018",
-      iecValidityFrom: "2025-01-24",
-      iecValidityUpto: "2030-01-23",
-      iecRenewalStatus: null,
-      iecAlarmAlert: null,
-      iecAction: null,
+      validityFrom: "2025-12-11",
+      validityUpto: "2027-12-10",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
     },
 
+    // IEC (P6) (4 rows)
+    {
+      sno: 4,
+      plant: "PEGEPL(P6)",
+      address: "303, 304, 305 AND 306/2, IALA-MAHESWARAM, RANGAREDDY",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList: "Perc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 4,
+      plant: "PEGEPL(P6)",
+      address: "303, 304, 305 AND 306/2, IALA-MAHESWARAM, RANGAREDDY",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 4,
+      plant: "PEGEPL(P6)",
+      address: "303, 304, 305 AND 306/2, IALA-MAHESWARAM, RANGAREDDY",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "PERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+    {
+      sno: 4,
+      plant: "PEGEPL(P6)",
+      address: "303, 304, 305 AND 306/2, IALA-MAHESWARAM, RANGAREDDY",
+      rNo: "ID 1111296708",
+      type: "IEC",
+      status: "Active",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: "2025-01-24",
+      validityUpto: "2030-01-23",
+      renewalStatus: "",
+      alarmAlert: "",
+      action: "",
+    },
+
+    // =========================
+    // 5) PEGEPL(P7)
+    // =========================
     {
       sno: 5,
       plant: "PEGEPL(P7)",
-      address: "TBD",
+      address:
+        "Plot no. UDL-5 . IP Seetharampur, Rangareddy  \nDt Shabad Rangareddy Seetharampur, \nTELANGANA-509217",
+      rNo: "-",
       type: "BIS",
-
-      // BIS
-      bisRNo: "TBD",
-      bisStatus: "Pending",
-      bisModelList: "TBD",
-      bisStandard: "TBD",
-      bisValidityFrom: null,
-      bisValidityUpto: null,
-      bisRenewalStatus: "",
-      bisAlarmAlert: "Start Certification",
-      bisAction:
-        "Samples are already submitted. Expected BIS certification by WW3 of Jan'26",
-
-      // IEC (not provided for P7 in your pasted table)
-      iecRNo: null,
-      iecStatus: null,
-      iecModelList: null,
-      iecStandard: null,
-      iecValidityFrom: null,
-      iecValidityUpto: null,
-      iecRenewalStatus: null,
-      iecAlarmAlert: null,
-      iecAction: null,
+      status: "-",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 600)",
+      standard:
+        "IS 14286 (PART 1/SEC 1) : 2023/ IEC 61215-1-1: 2021 & IS/IEC 61730-1: 2023 & IS/IEC 61730-2: 2023",
+      validityFrom: null,
+      validityUpto: null,
+      renewalStatus: "",
+      alarmAlert: "To Start Certification",
+      action:
+        "Samples are already submitted.Waiting for factory license, Expected BIS start March,2026 and completion by may,2026",
+    },
+    {
+      sno: 5,
+      plant: "PEGEPL(P7)",
+      address:
+        "Plot no. UDL-5 . IP Seetharampur, Rangareddy  \nDt Shabad Rangareddy Seetharampur, \nTELANGANA-509217",
+      rNo: "-",
+      type: "IEC",
+      status: "-",
+      modelList: "Perc Dual Glass M10: PE-XXXHGB(where xxx- 560 to 525)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: null,
+      validityUpto: null,
+      renewalStatus: "",
+      alarmAlert: "To Start Certification",
+      action:
+        "Samples are already submitted.Waiting for factory witness in feb/march,once P7 is ready,Expected  IEC in March/April,2026",
+    },
+    {
+      sno: 5,
+      plant: "PEGEPL(P7)",
+      address:
+        "Plot no. UDL-5 . IP Seetharampur, Rangareddy  \nDt Shabad Rangareddy Seetharampur, \nTELANGANA-509217",
+      rNo: "-",
+      type: "IEC",
+      status: "-",
+      modelList:
+        "TopCON Dual Glass M10: PEI-144-xxxTHGB-M10 (where xxx- 590 to 560)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: null,
+      validityUpto: null,
+      renewalStatus: "",
+      alarmAlert: "To Start Certification",
+      action:
+        "Samples are already submitted.Waiting for factory witness in feb/march,once P7 is ready,Expected  IEC in March/April,2026",
+    },
+    {
+      sno: 5,
+      plant: "PEGEPL(P7)",
+      address:
+        "Plot no. UDL-5 . IP Seetharampur, Rangareddy  \nDt Shabad Rangareddy Seetharampur, \nTELANGANA-509217",
+      rNo: "-",
+      type: "IEC",
+      status: "-",
+      modelList:
+        "PERC Dual Glass G12: PEI-132-xxxHGB-G12(where xxx-670 to 645)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: null,
+      validityUpto: null,
+      renewalStatus: "",
+      alarmAlert: "To Start Certification",
+      action:
+        "Samples are already submitted.Waiting for factory witness in feb/march,once P7 is ready,Expected  IEC in March/April,2026",
+    },
+    {
+      sno: 5,
+      plant: "PEGEPL(P7)",
+      address:
+        "Plot no. UDL-5 . IP Seetharampur, Rangareddy  \nDt Shabad Rangareddy Seetharampur, \nTELANGANA-509217",
+      rNo: "-",
+      type: "IEC",
+      status: "-",
+      modelList:
+        "TopCON Dual Glass G12R: PE-132-xxxTHGB-G12R (where xxx-630 to 570)",
+      standard:
+        "IEC 61215-1:2021 , IEC 61215-1-1:2021 ,IEC 61215-2:2021 ,IEC 61730-1:2023 ,IEC 61730-2:2023 ,EN IEC 61215-1:2021 \nEN IEC 61215-1-1:2021 ,EN IEC 61215-2:2021 \nEN IEC 61730-1:2018 ,EN IEC 61730-2:2018",
+      validityFrom: null,
+      validityUpto: null,
+      renewalStatus: "",
+      alarmAlert: "To Start Certification",
+      action:
+        "Samples are already submitted.Waiting for factory witness in feb/march,once P7 is ready,Expected  IEC in March/April,2026",
     },
   ];
 
@@ -1044,6 +1559,9 @@ async function seedIfEmpty() {
 INSERT INTO dbo.Certifications (
   id, sno, plant, address, type,
 
+  rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+
+  /* keep split columns empty for new row-wise structure */
   bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
   iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
 
@@ -1052,40 +1570,34 @@ INSERT INTO dbo.Certifications (
 ) VALUES (
   @id, @sno, @plant, @address, @type,
 
-  @bisRNo, @bisStatus, @bisModelList, @bisStandard, @bisValidityFrom, @bisValidityUpto, @bisRenewalStatus, @bisAlarmAlert, @bisAction,
-  @iecRNo, @iecStatus, @iecModelList, @iecStandard, @iecValidityFrom, @iecValidityUpto, @iecRenewalStatus, @iecAlarmAlert, @iecAction,
+  @rNo, @status, @modelList, @standard, @validityFrom, @validityUpto, @renewalStatus, @alarmAlert, @action,
+
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
 
   NULL, NULL, NULL,
   @createdAt, @updatedAt
 );
-
-`,
+      `,
       {
         id,
         sno: c.sno,
         plant: c.plant,
-        address: c.address,
-        type: c.type,
+        address: c.address || null,
+        type:
+          normalizeCertType(c.type || "BIS") === "BIS & IEC"
+            ? "BIS"
+            : normalizeCertType(c.type || "BIS"),
 
-        bisRNo: c.bisRNo,
-        bisStatus: c.bisStatus,
-        bisModelList: c.bisModelList,
-        bisStandard: c.bisStandard,
-        bisValidityFrom: c.bisValidityFrom,
-        bisValidityUpto: c.bisValidityUpto,
-        bisRenewalStatus: c.bisRenewalStatus,
-        bisAlarmAlert: c.bisAlarmAlert,
-        bisAction: c.bisAction,
-
-        iecRNo: c.iecRNo,
-        iecStatus: c.iecStatus,
-        iecModelList: c.iecModelList,
-        iecStandard: c.iecStandard,
-        iecValidityFrom: c.iecValidityFrom,
-        iecValidityUpto: c.iecValidityUpto,
-        iecRenewalStatus: c.iecRenewalStatus,
-        iecAlarmAlert: c.iecAlarmAlert,
-        iecAction: c.iecAction,
+        rNo: c.rNo ?? null,
+        status: c.status ?? null,
+        modelList: c.modelList ?? null,
+        standard: c.standard ?? null,
+        validityFrom: c.validityFrom ? parseDateOrNull(c.validityFrom) : null,
+        validityUpto: c.validityUpto ? parseDateOrNull(c.validityUpto) : null,
+        renewalStatus: c.renewalStatus ?? null,
+        alarmAlert: c.alarmAlert ?? null,
+        action: c.action ?? null,
 
         createdAt: now,
         updatedAt: now,
@@ -1104,6 +1616,18 @@ function mapCertificationRow(r) {
     address: r.address || "",
     type: r.type || "BIS",
 
+    // ✅ LEGACY (row-wise) fields (this is what your new sheet/frontend needs)
+    rNo: r.rNo || "",
+    status: r.status || "",
+    modelList: r.modelList || "",
+    standard: r.standard || "",
+    validityFrom: r.validityFrom ? toYMD(r.validityFrom) : "",
+    validityUpto: r.validityUpto ? toYMD(r.validityUpto) : "",
+    renewalStatus: r.renewalStatus || "",
+    alarmAlert: r.alarmAlert || "",
+    action: r.action || "",
+
+    // Keep split columns for backward compatibility (safe to keep)
     bisRNo: r.bisRNo || "",
     bisStatus: r.bisStatus || "",
     bisModelList: r.bisModelList || "",
@@ -1233,57 +1757,47 @@ VALUES (@id, @name, @email, @role, @isActive, @createdAt, @updatedAt);
         );
       }
 
-      // Insert certifications from Excel
-      // Insert certifications from Excel (combined BIS/IEC rows per sno)
+      // Insert certifications from Excel (ROW-WISE)
       for (const c of certRows) {
         const id = crypto.randomUUID();
         await execSqlTx(
           tx,
           `
-INSERT INTO dbo.Certifications (
-  id, sno, plant, address, type,
-
-  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
-  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
-
-  attachmentName, attachmentType, attachmentData,
-  createdAt, updatedAt
-) VALUES (
-  @id, @sno, @plant, @address, @type,
-
-  @bisRNo, @bisStatus, @bisModelList, @bisStandard, @bisValidityFrom, @bisValidityUpto, @bisRenewalStatus, @bisAlarmAlert, @bisAction,
-  @iecRNo, @iecStatus, @iecModelList, @iecStandard, @iecValidityFrom, @iecValidityUpto, @iecRenewalStatus, @iecAlarmAlert, @iecAction,
-
-  NULL, NULL, NULL,
-  @createdAt, @updatedAt
-);
-    `,
+      INSERT INTO dbo.Certifications (
+        id, sno, plant, address, type,
+        rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+        attachmentName, attachmentType, attachmentData,
+        createdAt, updatedAt
+      ) VALUES (
+        @id, @sno, @plant, @address, @type,
+        @rNo, @status, @modelList, @standard, @validityFrom, @validityUpto, @renewalStatus, @alarmAlert, @action,
+        NULL, NULL, NULL,
+        @createdAt, @updatedAt
+      );
+                `,
           {
             id,
             sno: c.sno,
             plant: c.plant,
             address: c.address || null,
-            type: c.type,
+            type:
+              normalizeCertType(c.type || "BIS") === "BIS & IEC"
+                ? "BIS"
+                : normalizeCertType(c.type || "BIS"),
 
-            bisRNo: c.bisRNo || null,
-            bisStatus: c.bisStatus || null,
-            bisModelList: c.bisModelList || null,
-            bisStandard: c.bisStandard || null,
-            bisValidityFrom: c.bisValidityFrom || null,
-            bisValidityUpto: c.bisValidityUpto || null,
-            bisRenewalStatus: c.bisRenewalStatus || null,
-            bisAlarmAlert: c.bisAlarmAlert || null,
-            bisAction: c.bisAction || null,
-
-            iecRNo: c.iecRNo || null,
-            iecStatus: c.iecStatus || null,
-            iecModelList: c.iecModelList || null,
-            iecStandard: c.iecStandard || null,
-            iecValidityFrom: c.iecValidityFrom || null,
-            iecValidityUpto: c.iecValidityUpto || null,
-            iecRenewalStatus: c.iecRenewalStatus || null,
-            iecAlarmAlert: c.iecAlarmAlert || null,
-            iecAction: c.iecAction || null,
+            rNo: c.rNo || null,
+            status: c.status || null,
+            modelList: c.modelList || null,
+            standard: c.standard || null,
+            validityFrom: c.validityFrom
+              ? parseDateOrNull(c.validityFrom)
+              : null,
+            validityUpto: c.validityUpto
+              ? parseDateOrNull(c.validityUpto)
+              : null,
+            renewalStatus: c.renewalStatus || null,
+            alarmAlert: c.alarmAlert || null,
+            action: c.action || null,
 
             createdAt: now,
             updatedAt: now,
@@ -1341,6 +1855,10 @@ AND (
   OR LOWER(ISNULL(bisStatus,'')) LIKE @q
   OR LOWER(ISNULL(iecStatus,'')) LIKE @q
   OR LOWER(ISNULL(status,'')) LIKE @q
+    OR LOWER(ISNULL(modelList,'')) LIKE @q
+  OR LOWER(ISNULL(standard,'')) LIKE @q
+  OR LOWER(ISNULL(action,'')) LIKE @q
+
 )`;
       bind.q = `%${q}%`;
     }
@@ -1349,6 +1867,9 @@ AND (
       `
     SELECT
       id, sno, plant, address, type,
+
+      rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+
     
       bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
       iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
@@ -1501,40 +2022,18 @@ app.post("/api/certifications", async (req, res) => {
     const now = new Date();
     const id = asGuid(body.id);
 
-    const typeKey = normalizeCertType(body.type || "BIS");
+    const sno = Number(body.sno);
+    const plant = String(body.plant || "").trim();
+    const address = String(body.address || "").trim();
+    const type = normalizeCertType(body.type || "BIS");
+    const rowType = type === "BIS & IEC" ? "BIS" : type;
 
-    if (!base.plant || !base.rNo) {
-      return res.status(400).json({ error: "plant and rNo are required" });
+    if (!Number.isFinite(sno) || sno <= 0) {
+      return res.status(400).json({ error: "sno must be a positive number" });
     }
-
-    // map single-row inputs into BIS/IEC columns (minimal compatibility)
-    const bis = typeKey.includes("IEC")
-      ? {}
-      : {
-          bisRNo: base.rNo,
-          bisStatus: base.status,
-          bisModelList: base.modelList,
-          bisStandard: base.standard,
-          bisValidityFrom: base.validityFrom,
-          bisValidityUpto: base.validityUpto,
-          bisRenewalStatus: base.renewalStatus,
-          bisAlarmAlert: base.alarmAlert,
-          bisAction: base.action,
-        };
-
-    const iec = typeKey.includes("IEC")
-      ? {
-          iecRNo: base.rNo,
-          iecStatus: base.status,
-          iecModelList: base.modelList,
-          iecStandard: base.standard,
-          iecValidityFrom: base.validityFrom,
-          iecValidityUpto: base.validityUpto,
-          iecRenewalStatus: base.renewalStatus,
-          iecAlarmAlert: base.alarmAlert,
-          iecAction: base.action,
-        }
-      : {};
+    if (!plant) {
+      return res.status(400).json({ error: "plant is required" });
+    }
 
     const parsedAtt = parseAttachmentFromBody(body);
 
@@ -1543,16 +2042,14 @@ app.post("/api/certifications", async (req, res) => {
 INSERT INTO dbo.Certifications (
   id, sno, plant, address, type,
 
-  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
-  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+  rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
 
   attachmentName, attachmentType, attachmentData,
   createdAt, updatedAt
 ) VALUES (
   @id, @sno, @plant, @address, @type,
 
-  @bisRNo, @bisStatus, @bisModelList, @bisStandard, @bisValidityFrom, @bisValidityUpto, @bisRenewalStatus, @bisAlarmAlert, @bisAction,
-  @iecRNo, @iecStatus, @iecModelList, @iecStandard, @iecValidityFrom, @iecValidityUpto, @iecRenewalStatus, @iecAlarmAlert, @iecAction,
+  @rNo, @status, @modelList, @standard, @validityFrom, @validityUpto, @renewalStatus, @alarmAlert, @action,
 
   @attachmentName, @attachmentType, @attachmentData,
   @createdAt, @updatedAt
@@ -1560,30 +2057,20 @@ INSERT INTO dbo.Certifications (
       `,
       {
         id,
-        sno: base.sno,
-        plant: base.plant,
-        address: base.address || null,
-        type: base.type,
+        sno,
+        plant,
+        address: address || null,
+        type: rowType,
 
-        bisRNo: bis.bisRNo || null,
-        bisStatus: bis.bisStatus || null,
-        bisModelList: bis.bisModelList || null,
-        bisStandard: bis.bisStandard || null,
-        bisValidityFrom: bis.bisValidityFrom || null,
-        bisValidityUpto: bis.bisValidityUpto || null,
-        bisRenewalStatus: bis.bisRenewalStatus || null,
-        bisAlarmAlert: bis.bisAlarmAlert || null,
-        bisAction: bis.bisAction || null,
-
-        iecRNo: iec.iecRNo || null,
-        iecStatus: iec.iecStatus || null,
-        iecModelList: iec.iecModelList || null,
-        iecStandard: iec.iecStandard || null,
-        iecValidityFrom: iec.iecValidityFrom || null,
-        iecValidityUpto: iec.iecValidityUpto || null,
-        iecRenewalStatus: iec.iecRenewalStatus || null,
-        iecAlarmAlert: iec.iecAlarmAlert || null,
-        iecAction: iec.iecAction || null,
+        rNo: body.rNo ?? null,
+        status: body.status ?? null,
+        modelList: body.modelList ?? null,
+        standard: body.standard ?? null,
+        validityFrom: body.validityFrom ? parseDateOrNull(body.validityFrom) : null,
+        validityUpto: body.validityUpto ? parseDateOrNull(body.validityUpto) : null,
+        renewalStatus: body.renewalStatus ?? null,
+        alarmAlert: body.alarmAlert ?? null,
+        action: body.action ?? null,
 
         attachmentName: parsedAtt.name || null,
         attachmentType: parsedAtt.type || null,
@@ -1598,6 +2085,8 @@ INSERT INTO dbo.Certifications (
       `
 SELECT TOP 1
   id, sno, plant, address, type,
+
+  rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
 
   bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
   iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
@@ -1616,12 +2105,11 @@ WHERE id = @id;
     console.error(e);
     const status = e?.status || 500;
     const msg =
-      status === 413
-        ? String(e?.message || e)
-        : "Failed to create certification";
+      status === 413 ? String(e?.message || e) : "Failed to create certification";
     res.status(status).json({ error: msg });
   }
 });
+
 
 app.put("/api/certifications/:id", async (req, res) => {
   try {
@@ -1635,6 +2123,18 @@ app.put("/api/certifications/:id", async (req, res) => {
       "address",
       "type",
 
+      // ✅ legacy row-wise fields
+      "rNo",
+      "status",
+      "modelList",
+      "standard",
+      "validityFrom",
+      "validityUpto",
+      "renewalStatus",
+      "alarmAlert",
+      "action",
+
+      // split fields kept for backward compatibility
       "bisRNo",
       "bisStatus",
       "bisModelList",
@@ -1654,6 +2154,7 @@ app.put("/api/certifications/:id", async (req, res) => {
       "iecAlarmAlert",
       "iecAction",
     ];
+
 
     const sets = [];
     const bind = { id, updatedAt: now };
@@ -2295,6 +2796,24 @@ async function runNotificationJob() {
   // Expand a combined row into "virtual" BIS and/or IEC rows so all existing
   // email builder logic can keep using: rNo, status, validityFrom, validityUpto...
   function expandCert(row) {
+    // ✅ If legacy row-wise fields exist, treat this as ONE notification unit
+    const hasLegacy =
+      Boolean(row.rNo) ||
+      Boolean(row.validityUpto) ||
+      Boolean(row.validityFrom) ||
+      Boolean(row.status) ||
+      Boolean(row.modelList) ||
+      Boolean(row.standard) ||
+      Boolean(row.action) ||
+      Boolean(row.alarmAlert);
+
+    if (hasLegacy) {
+      const t = normalizeCertType(row.type || "BIS");
+      const oneType = t === "BIS & IEC" ? "BIS" : t;
+      return [{ ...row, type: oneType, _typeKey: oneType }];
+    }
+
+    // ✅ Fallback (older combined rows) — keep your existing logic
     const out = [];
 
     const hasBIS =
@@ -2343,9 +2862,9 @@ async function runNotificationJob() {
       });
     }
 
-    // If neither has data (unlikely), treat as skip.
     return out;
   }
+
 
   for (const parent of certs) {
     const virtuals = expandCert(parent);

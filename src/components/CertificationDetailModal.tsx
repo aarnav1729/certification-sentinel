@@ -30,6 +30,50 @@ export const CertificationDetailModal = ({
 
   if (!certification) return null;
 
+  const getEffectiveFields = (cert: Certification) => {
+    const hasLegacy =
+      Boolean((cert as any).rNo) ||
+      Boolean((cert as any).status) ||
+      Boolean((cert as any).modelList) ||
+      Boolean((cert as any).validityUpto);
+
+    if (hasLegacy) {
+      return {
+        rNo: (cert as any).rNo || "",
+        status: (cert as any).status || "",
+        modelList: (cert as any).modelList || "",
+        standard: (cert as any).standard || "",
+        validityFrom: (cert as any).validityFrom || "",
+        validityUpto: (cert as any).validityUpto || "",
+        renewalStatus: (cert as any).renewalStatus || "",
+        alarmAlert: (cert as any).alarmAlert || "",
+        action: (cert as any).action || "",
+      };
+    }
+
+    // fallback old
+    const isBIS = cert.type === "BIS";
+    return {
+      rNo: isBIS ? cert.bisRNo || "" : cert.iecRNo || "",
+      status: isBIS ? cert.bisStatus || "" : cert.iecStatus || "",
+      modelList: isBIS ? cert.bisModelList || "" : cert.iecModelList || "",
+      standard: isBIS ? cert.bisStandard || "" : cert.iecStandard || "",
+      validityFrom: isBIS
+        ? (cert.bisValidityFrom as any) || ""
+        : (cert.iecValidityFrom as any) || "",
+      validityUpto: isBIS
+        ? (cert.bisValidityUpto as any) || ""
+        : (cert.iecValidityUpto as any) || "",
+      renewalStatus: isBIS
+        ? cert.bisRenewalStatus || ""
+        : cert.iecRenewalStatus || "",
+      alarmAlert: isBIS ? cert.bisAlarmAlert || "" : cert.iecAlarmAlert || "",
+      action: isBIS ? cert.bisAction || "" : cert.iecAction || "",
+    };
+  };
+
+  const eff = getEffectiveFields(certification);
+
   const hasAttachment = Boolean(certification.hasAttachment);
 
   const handleDownload = async () => {
@@ -63,33 +107,49 @@ export const CertificationDetailModal = ({
         <div className="space-y-6 mt-4">
           <div className="flex flex-wrap gap-3 items-center justify-between">
             <div className="flex flex-wrap gap-2">
-              {certification.bisRNo ? (
+              {certification.type === "BIS & IEC" ? (
+                <>
+                  {certification.bisRNo ? (
+                    <div className="flex items-center gap-2">
+                      <TypeBadge type="BIS" />
+                      <StatusBadge
+                        status={(certification.bisStatus as any) || "Pending"}
+                      />
+                      {certification.bisValidityUpto ? (
+                        <ExpiryBadge
+                          validityUpto={certification.bisValidityUpto}
+                        />
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {certification.iecRNo ? (
+                    <div className="flex items-center gap-2">
+                      <TypeBadge type="IEC" />
+                      <StatusBadge
+                        status={(certification.iecStatus as any) || "Pending"}
+                      />
+                      {certification.iecValidityUpto ? (
+                        <ExpiryBadge
+                          validityUpto={certification.iecValidityUpto}
+                        />
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {!certification.bisRNo && !certification.iecRNo ? (
+                    <StatusBadge status="Pending" />
+                  ) : null}
+                </>
+              ) : (
                 <div className="flex items-center gap-2">
-                  <TypeBadge type="BIS" />
-                  <StatusBadge
-                    status={(certification.bisStatus as any) || "Pending"}
-                  />
-                  {certification.bisValidityUpto ? (
-                    <ExpiryBadge validityUpto={certification.bisValidityUpto} />
+                  <TypeBadge type={certification.type} />
+                  <StatusBadge status={(eff.status as any) || "Pending"} />
+                  {eff.validityUpto ? (
+                    <ExpiryBadge validityUpto={eff.validityUpto} />
                   ) : null}
                 </div>
-              ) : null}
-
-              {certification.iecRNo ? (
-                <div className="flex items-center gap-2">
-                  <TypeBadge type="IEC" />
-                  <StatusBadge
-                    status={(certification.iecStatus as any) || "Pending"}
-                  />
-                  {certification.iecValidityUpto ? (
-                    <ExpiryBadge validityUpto={certification.iecValidityUpto} />
-                  ) : null}
-                </div>
-              ) : null}
-
-              {!certification.bisRNo && !certification.iecRNo ? (
-                <StatusBadge status="Pending" />
-              ) : null}
+              )}
             </div>
 
             <div className="text-xs text-muted-foreground">
@@ -100,49 +160,47 @@ export const CertificationDetailModal = ({
           <Separator />
 
           <div className="space-y-6">
-            {certification.bisRNo ? (
+            {certification.type !== "BIS & IEC" && (
               <div className="rounded-lg border p-4">
                 <div className="flex items-center gap-2 mb-4">
-                  <TypeBadge type="BIS" />
-                  <StatusBadge
-                    status={(certification.bisStatus as any) || "Pending"}
-                  />
+                  <TypeBadge type={certification.type} />
+                  <StatusBadge status={(eff.status as any) || "Pending"} />
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div>
                     <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                      R-No
+                      R-No / ID
                     </h4>
-                    <p className="font-mono">{certification.bisRNo || "-"}</p>
+                    <p className="font-mono">{eff.rNo || "-"}</p>
                   </div>
 
                   <div>
                     <h4 className="text-sm font-medium text-muted-foreground mb-1">
                       Validity From
                     </h4>
-                    <p>{formatDate(certification.bisValidityFrom) || "-"}</p>
+                    <p>{formatDate(eff.validityFrom) || "-"}</p>
                   </div>
 
                   <div>
                     <h4 className="text-sm font-medium text-muted-foreground mb-1">
                       Validity Upto
                     </h4>
-                    <p>{formatDate(certification.bisValidityUpto) || "-"}</p>
+                    <p>{formatDate(eff.validityUpto) || "-"}</p>
                   </div>
 
                   <div>
                     <h4 className="text-sm font-medium text-muted-foreground mb-1">
                       Renewal Status
                     </h4>
-                    <p>{certification.bisRenewalStatus || "-"}</p>
+                    <p>{eff.renewalStatus || "-"}</p>
                   </div>
 
                   <div>
                     <h4 className="text-sm font-medium text-muted-foreground mb-1">
                       Alarm Alert
                     </h4>
-                    <p>{certification.bisAlarmAlert || "-"}</p>
+                    <p>{eff.alarmAlert || "-"}</p>
                   </div>
                 </div>
 
@@ -151,7 +209,7 @@ export const CertificationDetailModal = ({
                     Model List
                   </h4>
                   <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap font-mono">
-                    {certification.bisModelList || "-"}
+                    {eff.modelList || "-"}
                   </pre>
                 </div>
 
@@ -160,7 +218,7 @@ export const CertificationDetailModal = ({
                     Standard
                   </h4>
                   <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap">
-                    {certification.bisStandard || "-"}
+                    {eff.standard || "-"}
                   </pre>
                 </div>
 
@@ -169,85 +227,44 @@ export const CertificationDetailModal = ({
                     Action / Notes
                   </h4>
                   <p className="text-sm bg-accent p-3 rounded-lg whitespace-pre-wrap">
-                    {certification.bisAction || "-"}
+                    {eff.action || "-"}
                   </p>
                 </div>
               </div>
-            ) : null}
+            )}
 
-            {certification.iecRNo ? (
-              <div className="rounded-lg border p-4">
-                <div className="flex items-center gap-2 mb-4">
-                  <TypeBadge type="IEC" />
-                  <StatusBadge
-                    status={(certification.iecStatus as any) || "Pending"}
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div>
-                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                      ID
-                    </h4>
-                    <p className="font-mono">{certification.iecRNo || "-"}</p>
+            {/* fallback: old combined schema view (keep your old BIS/IEC sections) */}
+            {certification.type === "BIS & IEC" ? (
+              <>
+                {certification.bisRNo ? (
+                  <div className="rounded-lg border p-4">
+                    <div className="flex items-center gap-2 mb-4">
+                      <TypeBadge type="BIS" />
+                      <StatusBadge
+                        status={(certification.bisStatus as any) || "Pending"}
+                      />
+                    </div>
+                    {/* keep your existing BIS detail layout here if you want */}
+                    <div className="text-sm text-muted-foreground">
+                      This is a legacy combined BIS & IEC record.
+                    </div>
                   </div>
+                ) : null}
 
-                  <div>
-                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                      Validity From
-                    </h4>
-                    <p>{formatDate(certification.iecValidityFrom) || "-"}</p>
+                {certification.iecRNo ? (
+                  <div className="rounded-lg border p-4">
+                    <div className="flex items-center gap-2 mb-4">
+                      <TypeBadge type="IEC" />
+                      <StatusBadge
+                        status={(certification.iecStatus as any) || "Pending"}
+                      />
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      This is a legacy combined BIS & IEC record.
+                    </div>
                   </div>
-
-                  <div>
-                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                      Validity Upto
-                    </h4>
-                    <p>{formatDate(certification.iecValidityUpto) || "-"}</p>
-                  </div>
-
-                  <div>
-                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                      Renewal Status
-                    </h4>
-                    <p>{certification.iecRenewalStatus || "-"}</p>
-                  </div>
-
-                  <div>
-                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                      Alarm Alert
-                    </h4>
-                    <p>{certification.iecAlarmAlert || "-"}</p>
-                  </div>
-                </div>
-
-                <div className="mt-4">
-                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
-                    Model List
-                  </h4>
-                  <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap font-mono">
-                    {certification.iecModelList || "-"}
-                  </pre>
-                </div>
-
-                <div className="mt-4">
-                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
-                    Standard
-                  </h4>
-                  <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap">
-                    {certification.iecStandard || "-"}
-                  </pre>
-                </div>
-
-                <div className="mt-4">
-                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
-                    Action / Notes
-                  </h4>
-                  <p className="text-sm bg-accent p-3 rounded-lg whitespace-pre-wrap">
-                    {certification.iecAction || "-"}
-                  </p>
-                </div>
-              </div>
+                ) : null}
+              </>
             ) : null}
           </div>
 

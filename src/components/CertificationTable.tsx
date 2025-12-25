@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import {
   Table,
   TableBody,
@@ -30,7 +30,16 @@ import { formatDate } from "@/lib/expiryUtils";
 import { ExpiryBadge } from "./ExpiryBadge";
 import { StatusBadge } from "./StatusBadge";
 import { TypeBadge } from "./TypeBadge";
-import { MoreHorizontal, Pencil, Trash2, Search, Eye } from "lucide-react";
+import {
+  MoreHorizontal,
+  Pencil,
+  Trash2,
+  Search,
+  Eye,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
+
 import { toast } from "sonner";
 
 interface CertificationTableProps {
@@ -48,12 +57,22 @@ export const CertificationTable = ({
 }: CertificationTableProps) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+
+  const safeCerts = Array.isArray(certifications) ? certifications : [];
+
+  const query = useMemo(
+    () =>
+      String(searchQuery || "")
+        .toLowerCase()
+        .trim(),
+    [searchQuery]
+  );
 
   const filteredCerts = useMemo(() => {
-    const query = searchQuery.toLowerCase().trim();
-    if (!query) return certifications;
+    if (!query) return safeCerts;
 
-    return certifications.filter((cert) => {
+    return safeCerts.filter((cert) => {
       return (
         (cert.plant || "").toLowerCase().includes(query) ||
         (cert.address || "").toLowerCase().includes(query) ||
@@ -62,12 +81,140 @@ export const CertificationTable = ({
         (cert.iecRNo || "").toLowerCase().includes(query) ||
         (cert.bisStatus || "").toLowerCase().includes(query) ||
         (cert.iecStatus || "").toLowerCase().includes(query) ||
+        (cert.bisModelList || "").toLowerCase().includes(query) ||
+        (cert.iecModelList || "").toLowerCase().includes(query) ||
+        (cert.bisStandard || "").toLowerCase().includes(query) ||
+        (cert.iecStandard || "").toLowerCase().includes(query) ||
         String(cert.sno || "")
           .toLowerCase()
           .includes(query)
       );
     });
-  }, [certifications, searchQuery]);
+  }, [safeCerts, query]);
+
+  const groupedCerts = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        key: string;
+        sno: number;
+        plant: string;
+        address: string;
+        items: Certification[];
+      }
+    >();
+
+    for (const c of filteredCerts) {
+      const key = `${c.sno}||${c.plant}||${c.address}`;
+      const existing = map.get(key);
+      if (existing) {
+        existing.items.push(c);
+      } else {
+        map.set(key, {
+          key,
+          sno: c.sno,
+          plant: c.plant,
+          address: c.address,
+          items: [c],
+        });
+      }
+    }
+
+    // stable sort: by S.No and then type
+    const sortType = (t: string) => (t === "BIS" ? 0 : t === "IEC" ? 1 : 2);
+
+    return Array.from(map.values())
+      .sort((a, b) => (a.sno || 0) - (b.sno || 0))
+      .map((g) => ({
+        ...g,
+        items: g.items.sort((x, y) => sortType(x.type) - sortType(y.type)),
+      }));
+  }, [filteredCerts]);
+
+  const getEffectiveFields = (cert: Certification) => {
+    const hasLegacy =
+      Boolean((cert as any).rNo) ||
+      Boolean((cert as any).status) ||
+      Boolean((cert as any).modelList) ||
+      Boolean((cert as any).standard) ||
+      Boolean((cert as any).validityFrom) ||
+      Boolean((cert as any).validityUpto) ||
+      Boolean((cert as any).renewalStatus) ||
+      Boolean((cert as any).alarmAlert) ||
+      Boolean((cert as any).action);
+
+    if (hasLegacy) {
+      return {
+        type: (cert.type || "BIS") as any,
+        rNo: (cert as any).rNo || "",
+        status: (cert as any).status || "",
+        modelList: (cert as any).modelList || "",
+        standard: (cert as any).standard || "",
+        validityFrom: (cert as any).validityFrom || "",
+        validityUpto: (cert as any).validityUpto || "",
+        renewalStatus: (cert as any).renewalStatus || "",
+        alarmAlert: (cert as any).alarmAlert || "",
+        action: (cert as any).action || "",
+      };
+    }
+
+    // Fallback for older combined-row schema
+    const t = (cert.type || "BIS") as any;
+    const isBIS = t === "BIS";
+    const isIEC = t === "IEC";
+
+    // if old combined row (BIS & IEC), we keep it as-is (handled by old UI branches)
+    if (t === "BIS & IEC") {
+      return {
+        type: t,
+        rNo: "",
+        status: "",
+        modelList: "",
+        standard: "",
+        validityFrom: "",
+        validityUpto: "",
+        renewalStatus: "",
+        alarmAlert: "",
+        action: "",
+      };
+    }
+
+    return {
+      type: t,
+      rNo: isBIS ? cert.bisRNo || "" : cert.iecRNo || "",
+      status: isBIS ? cert.bisStatus || "" : cert.iecStatus || "",
+      modelList: isBIS ? cert.bisModelList || "" : cert.iecModelList || "",
+      standard: isBIS ? cert.bisStandard || "" : cert.iecStandard || "",
+      validityFrom: isBIS
+        ? (cert.bisValidityFrom as any) || ""
+        : (cert.iecValidityFrom as any) || "",
+      validityUpto: isBIS
+        ? (cert.bisValidityUpto as any) || ""
+        : (cert.iecValidityUpto as any) || "",
+      renewalStatus: isBIS
+        ? cert.bisRenewalStatus || ""
+        : cert.iecRenewalStatus || "",
+      alarmAlert: isBIS ? cert.bisAlarmAlert || "" : cert.iecAlarmAlert || "",
+      action: isBIS ? cert.bisAction || "" : cert.iecAction || "",
+    };
+  };
+
+  const getModelSummary = (cert: Certification) => {
+    const eff = getEffectiveFields(cert);
+
+    // Combined old row => choose first available
+    const raw =
+      cert.type === "BIS & IEC"
+        ? cert.bisModelList || cert.iecModelList || ""
+        : eff.modelList || "";
+
+    const first = String(raw || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .find(Boolean);
+
+    return first || "-";
+  };
 
   const handleDelete = async () => {
     if (!deleteId) return;
@@ -82,6 +229,8 @@ export const CertificationTable = ({
   };
 
   const renderRNoCell = (cert: Certification) => {
+    const eff = getEffectiveFields(cert);
+
     if (cert.type === "BIS & IEC") {
       return (
         <div className="space-y-1">
@@ -96,11 +245,13 @@ export const CertificationTable = ({
         </div>
       );
     }
-    if (cert.type === "BIS") return cert.bisRNo || "-";
-    return cert.iecRNo || "-";
+
+    return eff.rNo ? eff.rNo : "-";
   };
 
   const renderStatusCell = (cert: Certification) => {
+    const eff = getEffectiveFields(cert);
+
     if (cert.type === "BIS & IEC") {
       return (
         <div className="space-y-1">
@@ -115,21 +266,18 @@ export const CertificationTable = ({
         </div>
       );
     }
-    return (
-      <StatusBadge
-        status={
-          ((cert.type === "BIS" ? cert.bisStatus : cert.iecStatus) as any) ||
-          "Pending"
-        }
-      />
-    );
+
+    return <StatusBadge status={(eff.status as any) || "Pending"} />;
   };
 
   const pickValidityFrom = (cert: Certification) => {
-    return cert.type === "BIS" ? cert.bisValidityFrom : cert.iecValidityFrom;
+    const eff = getEffectiveFields(cert);
+    return eff.validityFrom || "";
   };
+
   const pickValidityUpto = (cert: Certification) => {
-    return cert.type === "BIS" ? cert.bisValidityUpto : cert.iecValidityUpto;
+    const eff = getEffectiveFields(cert);
+    return eff.validityUpto || "";
   };
 
   const renderValidityFromCell = (cert: Certification) => {
@@ -202,6 +350,38 @@ export const CertificationTable = ({
   };
 
   const renderAllDetailsCell = (cert: Certification) => {
+    // New row-wise record -> show compact single-line details
+    const eff = getEffectiveFields(cert);
+    const hasLegacy =
+      Boolean((cert as any).rNo) ||
+      Boolean((cert as any).modelList) ||
+      Boolean((cert as any).validityUpto) ||
+      Boolean((cert as any).status);
+
+    if (hasLegacy && cert.type !== "BIS & IEC") {
+      const line = [
+        `${cert.type}:`,
+        eff.rNo ? `No. ${eff.rNo}` : "No. -",
+        eff.status ? `(${eff.status})` : "(Pending)",
+        eff.validityFrom || eff.validityUpto
+          ? `| ${formatDate(eff.validityFrom || "")} → ${formatDate(
+              eff.validityUpto || ""
+            )}`
+          : "",
+        eff.alarmAlert ? `| Alarm: ${eff.alarmAlert}` : "",
+        eff.renewalStatus ? `| Renewal: ${eff.renewalStatus}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      return (
+        <div className="text-xs text-muted-foreground whitespace-pre-wrap line-clamp-3 max-w-[520px]">
+          {line}
+        </div>
+      );
+    }
+
+    // Fallback: old combined-row UI
     const lines: string[] = [];
 
     if (cert.bisRNo || cert.type === "BIS" || cert.type === "BIS & IEC") {
@@ -292,70 +472,159 @@ export const CertificationTable = ({
                 </TableCell>
               </TableRow>
             ) : (
-              filteredCerts.map((cert, index) => (
-                <TableRow
-                  key={cert.id}
-                  className="animate-fade-in hover:bg-muted/30 transition-colors"
-                  style={{ animationDelay: `${index * 50}ms` }}
-                >
-                  <TableCell className="font-medium">{cert.sno}</TableCell>
+              groupedCerts.map((group, gIndex) => {
+                const isOpen = openGroups[group.key] ?? true; // default open
+                const bisCount = group.items.filter(
+                  (x) => x.type === "BIS"
+                ).length;
+                const iecCount = group.items.filter(
+                  (x) => x.type === "IEC"
+                ).length;
 
-                  <TableCell>
-                    <div className="font-medium">{cert.plant}</div>
-                    <div className="text-xs text-muted-foreground line-clamp-1 max-w-[200px]">
-                      {cert.address}
-                    </div>
-                  </TableCell>
+                return (
+                  <Fragment key={group.key}>
+                    {/* Parent row (Plant) */}
+                    <TableRow
+                      className="bg-muted/40"
+                      style={{ animationDelay: `${gIndex * 50}ms` }}
+                    >
+                      <TableCell colSpan={10} className="py-3">
+                        <div className="flex items-start justify-between gap-4">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setOpenGroups((prev) => ({
+                                ...prev,
+                                [group.key]: !(prev[group.key] ?? true),
+                              }))
+                            }
+                            className="flex items-start gap-2 text-left"
+                          >
+                            {isOpen ? (
+                              <ChevronDown className="h-4 w-4 mt-1 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="h-4 w-4 mt-1 text-muted-foreground" />
+                            )}
 
-                  <TableCell className="font-mono text-sm">
-                    {renderRNoCell(cert)}
-                  </TableCell>
+                            <div>
+                              <div className="font-medium">
+                                {group.sno}. {group.plant}
+                              </div>
+                              <div className="text-xs text-muted-foreground whitespace-pre-wrap line-clamp-2 max-w-[900px]">
+                                {group.address}
+                              </div>
+                              <div className="mt-2 text-xs text-muted-foreground">
+                                <span className="mr-4">
+                                  BIS rows:{" "}
+                                  <span className="font-medium">
+                                    {bisCount}
+                                  </span>
+                                </span>
+                                <span>
+                                  IEC rows:{" "}
+                                  <span className="font-medium">
+                                    {iecCount}
+                                  </span>
+                                </span>
+                              </div>
+                            </div>
+                          </button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
 
-                  <TableCell>
-                    <TypeBadge type={cert.type} />
-                  </TableCell>
+                    {/* Children rows (BIS/IEC entries) */}
+                    {isOpen
+                      ? group.items.map((cert, index) => (
+                          <TableRow
+                            key={cert.id}
+                            className="animate-fade-in hover:bg-muted/30 transition-colors"
+                            style={{
+                              animationDelay: `${(gIndex * 10 + index) * 30}ms`,
+                            }}
+                          >
+                            {/* S.No */}
+                            <TableCell className="text-muted-foreground">
+                              {" "}
+                            </TableCell>
 
-                  <TableCell>{renderStatusCell(cert)}</TableCell>
+                            {/* Plant column -> show model summary instead */}
+                            <TableCell>
+                              <div className="font-medium">
+                                {getModelSummary(cert)}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                {cert.type === "BIS"
+                                  ? "BIS entry"
+                                  : "IEC entry"}
+                              </div>
+                            </TableCell>
 
-                  <TableCell>{renderValidityFromCell(cert)}</TableCell>
+                            <TableCell className="font-mono text-sm">
+                              {renderRNoCell(cert)}
+                            </TableCell>
 
-                  <TableCell>{renderValidityUptoCell(cert)}</TableCell>
+                            <TableCell>
+                              <TypeBadge type={cert.type} />
+                            </TableCell>
 
-                  <TableCell>{renderExpiryCell(cert)}</TableCell>
+                            <TableCell>{renderStatusCell(cert)}</TableCell>
 
-                  <TableCell>{renderAllDetailsCell(cert)}</TableCell>
+                            <TableCell>
+                              {renderValidityFromCell(cert)}
+                            </TableCell>
 
-                  <TableCell>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" className="h-8 w-8">
-                          <MoreHorizontal className="h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
+                            <TableCell>
+                              {renderValidityUptoCell(cert)}
+                            </TableCell>
 
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onClick={() => onView(cert)}>
-                          <Eye className="h-4 w-4 mr-2" />
-                          View Details
-                        </DropdownMenuItem>
+                            <TableCell>{renderExpiryCell(cert)}</TableCell>
 
-                        <DropdownMenuItem onClick={() => onEdit(cert)}>
-                          <Pencil className="h-4 w-4 mr-2" />
-                          Edit
-                        </DropdownMenuItem>
+                            <TableCell>{renderAllDetailsCell(cert)}</TableCell>
 
-                        <DropdownMenuItem
-                          onClick={() => setDeleteId(cert.id)}
-                          className="text-destructive focus:text-destructive"
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </TableCell>
-                </TableRow>
-              ))
+                            <TableCell>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                  >
+                                    <MoreHorizontal className="h-4 w-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+
+                                <DropdownMenuContent align="end">
+                                  <DropdownMenuItem
+                                    onClick={() => onView(cert)}
+                                  >
+                                    <Eye className="h-4 w-4 mr-2" />
+                                    View Details
+                                  </DropdownMenuItem>
+
+                                  <DropdownMenuItem
+                                    onClick={() => onEdit(cert)}
+                                  >
+                                    <Pencil className="h-4 w-4 mr-2" />
+                                    Edit
+                                  </DropdownMenuItem>
+
+                                  <DropdownMenuItem
+                                    onClick={() => setDeleteId(cert.id)}
+                                    className="text-destructive focus:text-destructive"
+                                  >
+                                    <Trash2 className="h-4 w-4 mr-2" />
+                                    Delete
+                                  </DropdownMenuItem>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </TableCell>
+                          </TableRow>
+                        ))
+                      : null}
+                  </Fragment>
+                );
+              })
             )}
           </TableBody>
         </Table>
