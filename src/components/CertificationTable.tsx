@@ -201,6 +201,54 @@ export const CertificationTable = ({
     return <ExpiryBadge validityUpto={upto} />;
   };
 
+  const renderAllDetailsCell = (cert: Certification) => {
+    const lines: string[] = [];
+
+    if (cert.bisRNo || cert.type === "BIS" || cert.type === "BIS & IEC") {
+      const bisLine = [
+        "BIS:",
+        cert.bisRNo ? `RNo ${cert.bisRNo}` : "RNo -",
+        cert.bisStatus ? `(${cert.bisStatus})` : "(Pending)",
+        cert.bisValidityFrom || cert.bisValidityUpto
+          ? `| ${formatDate(cert.bisValidityFrom || "")} → ${formatDate(
+              cert.bisValidityUpto || ""
+            )}`
+          : "",
+        cert.bisAlarmAlert ? `| Alarm: ${cert.bisAlarmAlert}` : "",
+        cert.bisRenewalStatus ? `| Renewal: ${cert.bisRenewalStatus}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      lines.push(bisLine);
+    }
+
+    if (cert.iecRNo || cert.type === "IEC" || cert.type === "BIS & IEC") {
+      const iecLine = [
+        "IEC:",
+        cert.iecRNo ? `ID ${cert.iecRNo}` : "ID -",
+        cert.iecStatus ? `(${cert.iecStatus})` : "(Pending)",
+        cert.iecValidityFrom || cert.iecValidityUpto
+          ? `| ${formatDate(cert.iecValidityFrom || "")} → ${formatDate(
+              cert.iecValidityUpto || ""
+            )}`
+          : "",
+        cert.iecAlarmAlert ? `| Alarm: ${cert.iecAlarmAlert}` : "",
+        cert.iecRenewalStatus ? `| Renewal: ${cert.iecRenewalStatus}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      lines.push(iecLine);
+    }
+
+    if (!lines.length) return <span className="text-muted-foreground">-</span>;
+
+    return (
+      <div className="text-xs text-muted-foreground whitespace-pre-wrap line-clamp-3 max-w-[520px]">
+        {lines.join("\n")}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-4">
       <div className="relative max-w-sm">
@@ -225,6 +273,8 @@ export const CertificationTable = ({
               <TableHead>Validity From</TableHead>
               <TableHead>Validity Upto</TableHead>
               <TableHead>Expiry Alert</TableHead>
+              <TableHead>All Details</TableHead>
+
               <TableHead className="w-12"></TableHead>
             </TableRow>
           </TableHeader>
@@ -233,7 +283,7 @@ export const CertificationTable = ({
             {filteredCerts.length === 0 ? (
               <TableRow>
                 <TableCell
-                  colSpan={9}
+                  colSpan={10}
                   className="text-center py-12 text-muted-foreground"
                 >
                   {searchQuery
@@ -272,6 +322,8 @@ export const CertificationTable = ({
                   <TableCell>{renderValidityUptoCell(cert)}</TableCell>
 
                   <TableCell>{renderExpiryCell(cert)}</TableCell>
+
+                  <TableCell>{renderAllDetailsCell(cert)}</TableCell>
 
                   <TableCell>
                     <DropdownMenu>

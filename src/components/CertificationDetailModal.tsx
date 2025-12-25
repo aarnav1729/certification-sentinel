@@ -62,10 +62,33 @@ export const CertificationDetailModal = ({
 
         <div className="space-y-6 mt-4">
           <div className="flex flex-wrap gap-3 items-center justify-between">
-            <div className="flex flex-wrap gap-3">
-              <StatusBadge status={certification.status} />
-              {certification.validityUpto ? (
-                <ExpiryBadge validityUpto={certification.validityUpto} />
+            <div className="flex flex-wrap gap-2">
+              {certification.bisRNo ? (
+                <div className="flex items-center gap-2">
+                  <TypeBadge type="BIS" />
+                  <StatusBadge
+                    status={(certification.bisStatus as any) || "Pending"}
+                  />
+                  {certification.bisValidityUpto ? (
+                    <ExpiryBadge validityUpto={certification.bisValidityUpto} />
+                  ) : null}
+                </div>
+              ) : null}
+
+              {certification.iecRNo ? (
+                <div className="flex items-center gap-2">
+                  <TypeBadge type="IEC" />
+                  <StatusBadge
+                    status={(certification.iecStatus as any) || "Pending"}
+                  />
+                  {certification.iecValidityUpto ? (
+                    <ExpiryBadge validityUpto={certification.iecValidityUpto} />
+                  ) : null}
+                </div>
+              ) : null}
+
+              {!certification.bisRNo && !certification.iecRNo ? (
+                <StatusBadge status="Pending" />
               ) : null}
             </div>
 
@@ -76,55 +99,156 @@ export const CertificationDetailModal = ({
 
           <Separator />
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                R-No / ID
-              </h4>
-              <p className="font-mono">{certification.rNo || "-"}</p>
-            </div>
+          <div className="space-y-6">
+            {certification.bisRNo ? (
+              <div className="rounded-lg border p-4">
+                <div className="flex items-center gap-2 mb-4">
+                  <TypeBadge type="BIS" />
+                  <StatusBadge
+                    status={(certification.bisStatus as any) || "Pending"}
+                  />
+                </div>
 
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                Type
-              </h4>
-              <p>{certification.type || "-"}</p>
-            </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      R-No
+                    </h4>
+                    <p className="font-mono">{certification.bisRNo || "-"}</p>
+                  </div>
 
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                Status
-              </h4>
-              <p>{certification.status || "-"}</p>
-            </div>
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Validity From
+                    </h4>
+                    <p>{formatDate(certification.bisValidityFrom) || "-"}</p>
+                  </div>
 
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                Renewal Status
-              </h4>
-              <p>{certification.renewalStatus || "-"}</p>
-            </div>
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Validity Upto
+                    </h4>
+                    <p>{formatDate(certification.bisValidityUpto) || "-"}</p>
+                  </div>
 
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                Alarm Alert
-              </h4>
-              <p>{certification.alarmAlert || "-"}</p>
-            </div>
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Renewal Status
+                    </h4>
+                    <p>{certification.bisRenewalStatus || "-"}</p>
+                  </div>
 
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                Validity From
-              </h4>
-              <p>{formatDate(certification.validityFrom) || "-"}</p>
-            </div>
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Alarm Alert
+                    </h4>
+                    <p>{certification.bisAlarmAlert || "-"}</p>
+                  </div>
+                </div>
 
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground mb-1">
-                Validity Upto
-              </h4>
-              <p>{formatDate(certification.validityUpto) || "-"}</p>
-            </div>
+                <div className="mt-4">
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
+                    Model List
+                  </h4>
+                  <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap font-mono">
+                    {certification.bisModelList || "-"}
+                  </pre>
+                </div>
+
+                <div className="mt-4">
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
+                    Standard
+                  </h4>
+                  <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap">
+                    {certification.bisStandard || "-"}
+                  </pre>
+                </div>
+
+                <div className="mt-4">
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
+                    Action / Notes
+                  </h4>
+                  <p className="text-sm bg-accent p-3 rounded-lg whitespace-pre-wrap">
+                    {certification.bisAction || "-"}
+                  </p>
+                </div>
+              </div>
+            ) : null}
+
+            {certification.iecRNo ? (
+              <div className="rounded-lg border p-4">
+                <div className="flex items-center gap-2 mb-4">
+                  <TypeBadge type="IEC" />
+                  <StatusBadge
+                    status={(certification.iecStatus as any) || "Pending"}
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      ID
+                    </h4>
+                    <p className="font-mono">{certification.iecRNo || "-"}</p>
+                  </div>
+
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Validity From
+                    </h4>
+                    <p>{formatDate(certification.iecValidityFrom) || "-"}</p>
+                  </div>
+
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Validity Upto
+                    </h4>
+                    <p>{formatDate(certification.iecValidityUpto) || "-"}</p>
+                  </div>
+
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Renewal Status
+                    </h4>
+                    <p>{certification.iecRenewalStatus || "-"}</p>
+                  </div>
+
+                  <div>
+                    <h4 className="text-sm font-medium text-muted-foreground mb-1">
+                      Alarm Alert
+                    </h4>
+                    <p>{certification.iecAlarmAlert || "-"}</p>
+                  </div>
+                </div>
+
+                <div className="mt-4">
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
+                    Model List
+                  </h4>
+                  <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap font-mono">
+                    {certification.iecModelList || "-"}
+                  </pre>
+                </div>
+
+                <div className="mt-4">
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
+                    Standard
+                  </h4>
+                  <pre className="text-sm bg-muted p-3 rounded-lg whitespace-pre-wrap">
+                    {certification.iecStandard || "-"}
+                  </pre>
+                </div>
+
+                <div className="mt-4">
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2">
+                    Action / Notes
+                  </h4>
+                  <p className="text-sm bg-accent p-3 rounded-lg whitespace-pre-wrap">
+                    {certification.iecAction || "-"}
+                  </p>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div>
