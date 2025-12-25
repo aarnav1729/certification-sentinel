@@ -2663,7 +2663,7 @@ function buildEmailHtml(cert, status) {
       </div>
 
       <div style="padding:14px 24px;background:#fafafa;border-top:1px solid #eef0f5;color:#6b7280;font-size:12px;line-height:1.5;">
-        Automated notification from WAVE Certification Tracker.
+        Automated notification from Premier Energies Certification Tracker.
         ${
           isOverdue
             ? "Overdue alerts are sent daily until updated."
