@@ -678,6 +678,38 @@ BEGIN
   ALTER TABLE dbo.Certifications ADD attachmentData VARBINARY(MAX) NULL;
 END;
 
+/* ---- Soft Delete columns (idempotent upgrades) ---- */
+IF COL_LENGTH(N'dbo.Certifications', N'isDeleted') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD isDeleted BIT NOT NULL CONSTRAINT DF_Certifications_isDeleted DEFAULT(0);
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'deletedAt') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD deletedAt DATETIME2(3) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'deletedReason') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD deletedReason NVARCHAR(MAX) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'deleteProofName') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD deleteProofName NVARCHAR(260) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'deleteProofType') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD deleteProofType NVARCHAR(120) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.Certifications', N'deleteProofData') IS NULL
+BEGIN
+  ALTER TABLE dbo.Certifications ADD deleteProofData VARBINARY(MAX) NULL;
+END;
+
+
 /* ---- Legacy single-row columns (backward compatibility) ---- */
 /* Some existing DBs already have these columns as NOT NULL.
    Our Excel-reset path does not populate them, so we must allow NULLs. */
@@ -786,6 +818,14 @@ END;
 
 IF NOT EXISTS (
   SELECT 1 FROM sys.indexes
+  WHERE name = N'IX_Certifications_IsDeleted' AND object_id = OBJECT_ID(N'dbo.Certifications')
+)
+BEGIN
+  CREATE INDEX IX_Certifications_IsDeleted ON dbo.Certifications(isDeleted);
+END;
+
+IF NOT EXISTS (
+  SELECT 1 FROM sys.indexes
   WHERE name = N'IX_Certifications_BIS_ValidityUpto' AND object_id = OBJECT_ID(N'dbo.Certifications')
 )
 BEGIN
@@ -844,6 +884,31 @@ BEGIN
     ADD CONSTRAINT FK_EmailLogs_Certifications
     FOREIGN KEY (certificationId) REFERENCES dbo.Certifications(id)
     ON DELETE CASCADE;
+END;
+
+/* =========================
+   Email Digest Logs (Daily consolidated emails)
+========================= */
+IF OBJECT_ID(N'dbo.EmailDigestLogs', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.EmailDigestLogs (
+    id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+    digestType NVARCHAR(30) NOT NULL,      -- overdue-digest
+    ymd CHAR(10) NOT NULL,                 -- YYYY-MM-DD (IST day)
+    recipientEmail NVARCHAR(320) NOT NULL,
+    sentAt DATETIME2(3) NOT NULL,
+    status NVARCHAR(20) NOT NULL,          -- sent / failed
+    error NVARCHAR(MAX) NULL
+  );
+END;
+
+IF NOT EXISTS (
+  SELECT 1 FROM sys.indexes
+  WHERE name = N'UX_EmailDigestLogs_OncePerDay' AND object_id = OBJECT_ID(N'dbo.EmailDigestLogs')
+)
+BEGIN
+  CREATE UNIQUE INDEX UX_EmailDigestLogs_OncePerDay
+    ON dbo.EmailDigestLogs(digestType, ymd, recipientEmail);
 END;
 
 IF NOT EXISTS (
@@ -1653,6 +1718,10 @@ function mapCertificationRow(r) {
     attachmentType: r.attachmentType || "",
     createdAt: r.createdAt ? toISO(r.createdAt) : "",
     updatedAt: r.updatedAt ? toISO(r.updatedAt) : "",
+    isDeleted: Boolean(r.isDeleted),
+    deletedAt: r.deletedAt ? toISO(r.deletedAt) : "",
+    deletedReason: r.deletedReason || "",
+    hasDeleteProof: Boolean(r.hasDeleteProof),
   };
 }
 
@@ -1829,13 +1898,16 @@ VALUES (@id, @name, @email, @role, @isActive, @createdAt, @updatedAt);
 /* ---- Certifications CRUD ---- */
 
 app.get("/api/certifications", async (req, res) => {
+  const includeDeleted = String(req.query.includeDeleted || "") === "1";
+
   try {
     const q = String(req.query.q || "")
       .trim()
       .toLowerCase();
     const status = String(req.query.status || "").trim();
 
-    let where = "1=1";
+    let where = includeDeleted ? "1=1" : "isDeleted = 0";
+
     const bind = {};
 
     if (status) {
@@ -1867,20 +1939,23 @@ AND (
       `
     SELECT
       id, sno, plant, address, type,
-
+    
       rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
-
     
       bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
       iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
     
       attachmentName, attachmentType,
       CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
-      createdAt, updatedAt
+    
+      createdAt, updatedAt,
+      isDeleted, deletedAt, deletedReason,
+      CASE WHEN deleteProofData IS NULL THEN 0 ELSE 1 END AS hasDeleteProof
+    
     FROM dbo.Certifications
     WHERE ${where}
     ORDER BY sno ASC, createdAt ASC;
-    `,
+      `,
       bind
     );
 
@@ -1897,17 +1972,22 @@ app.get("/api/certifications/:id", async (req, res) => {
 
     const out = await execSql(
       `
-SELECT TOP 1
-  id, sno, plant, address, type,
-
-  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
-  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
-
-  attachmentName, attachmentType,
-  CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
-  createdAt, updatedAt
-FROM dbo.Certifications
-WHERE id = @id;
+    SELECT TOP 1
+      id, sno, plant, address, type,
+    
+      rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+    
+      bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+      iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+    
+      attachmentName, attachmentType,
+      CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
+    
+      createdAt, updatedAt,
+      isDeleted, deletedAt, deletedReason,
+      CASE WHEN deleteProofData IS NULL THEN 0 ELSE 1 END AS hasDeleteProof
+    FROM dbo.Certifications
+    WHERE id = @id;
       `,
       { id }
     );
@@ -2016,6 +2096,56 @@ function parseAttachmentFromBody(body) {
   return { clear: false, name, type, data };
 }
 
+function parseDeleteProofFromBody(body) {
+  const reason = String(body?.deleteReason || "").trim();
+  const proof = body?.deleteProof;
+
+  if (!reason) {
+    const err = new Error("deleteReason is required");
+    err.status = 400;
+    throw err;
+  }
+
+  if (!proof) {
+    const err = new Error("deleteProof is required");
+    err.status = 400;
+    throw err;
+  }
+
+  const name = String(proof.name || "").trim();
+  const type = String(proof.type || "application/octet-stream").trim();
+  const base64 = String(proof.base64 || "").trim();
+
+  if (!name || !base64) {
+    const err = new Error(
+      "deleteProof.name and deleteProof.base64 are required"
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  let data = null;
+  try {
+    data = Buffer.from(base64, "base64");
+  } catch {
+    data = null;
+  }
+
+  if (!data || !data.length) {
+    const err = new Error("Invalid deleteProof base64");
+    err.status = 400;
+    throw err;
+  }
+
+  if (data.length > 10 * 1024 * 1024) {
+    const err = new Error("Proof attachment too large (max 10MB)");
+    err.status = 413;
+    throw err;
+  }
+
+  return { reason, name, type, data };
+}
+
 app.post("/api/certifications", async (req, res) => {
   try {
     const body = req.body || {};
@@ -2066,8 +2196,12 @@ INSERT INTO dbo.Certifications (
         status: body.status ?? null,
         modelList: body.modelList ?? null,
         standard: body.standard ?? null,
-        validityFrom: body.validityFrom ? parseDateOrNull(body.validityFrom) : null,
-        validityUpto: body.validityUpto ? parseDateOrNull(body.validityUpto) : null,
+        validityFrom: body.validityFrom
+          ? parseDateOrNull(body.validityFrom)
+          : null,
+        validityUpto: body.validityUpto
+          ? parseDateOrNull(body.validityUpto)
+          : null,
         renewalStatus: body.renewalStatus ?? null,
         alarmAlert: body.alarmAlert ?? null,
         action: body.action ?? null,
@@ -2105,11 +2239,12 @@ WHERE id = @id;
     console.error(e);
     const status = e?.status || 500;
     const msg =
-      status === 413 ? String(e?.message || e) : "Failed to create certification";
+      status === 413
+        ? String(e?.message || e)
+        : "Failed to create certification";
     res.status(status).json({ error: msg });
   }
 });
-
 
 app.put("/api/certifications/:id", async (req, res) => {
   try {
@@ -2154,7 +2289,6 @@ app.put("/api/certifications/:id", async (req, res) => {
       "iecAlarmAlert",
       "iecAction",
     ];
-
 
     const sets = [];
     const bind = { id, updatedAt: now };
@@ -2215,17 +2349,22 @@ WHERE id = @id;
 
     const out = await execSql(
       `
-SELECT TOP 1
-  id, sno, plant, address, type,
-
-  bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
-  iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
-
-  attachmentName, attachmentType,
-  CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
-  createdAt, updatedAt
-FROM dbo.Certifications
-WHERE id = @id;
+    SELECT TOP 1
+      id, sno, plant, address, type,
+    
+      rNo, status, modelList, standard, validityFrom, validityUpto, renewalStatus, alarmAlert, action,
+    
+      bisRNo, bisStatus, bisModelList, bisStandard, bisValidityFrom, bisValidityUpto, bisRenewalStatus, bisAlarmAlert, bisAction,
+      iecRNo, iecStatus, iecModelList, iecStandard, iecValidityFrom, iecValidityUpto, iecRenewalStatus, iecAlarmAlert, iecAction,
+    
+      attachmentName, attachmentType,
+      CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
+    
+      createdAt, updatedAt,
+      isDeleted, deletedAt, deletedReason,
+      CASE WHEN deleteProofData IS NULL THEN 0 ELSE 1 END AS hasDeleteProof
+    FROM dbo.Certifications
+    WHERE id = @id;
       `,
       { id }
     );
@@ -2247,10 +2386,39 @@ WHERE id = @id;
 app.delete("/api/certifications/:id", async (req, res) => {
   try {
     const id = String(req.params.id || "");
-    await execSql(`DELETE FROM dbo.Certifications WHERE id = @id;`, { id });
+    const body = req.body || {};
+    const now = new Date();
+
+    const parsed = parseDeleteProofFromBody(body);
+
+    await execSql(
+      `
+UPDATE dbo.Certifications
+SET
+  isDeleted = 1,
+  deletedAt = @deletedAt,
+  deletedReason = @deletedReason,
+  deleteProofName = @deleteProofName,
+  deleteProofType = @deleteProofType,
+  deleteProofData = @deleteProofData,
+  updatedAt = @updatedAt
+WHERE id = @id AND isDeleted = 0;
+`,
+      {
+        id,
+        deletedAt: now,
+        deletedReason: parsed.reason,
+        deleteProofName: parsed.name,
+        deleteProofType: parsed.type,
+        deleteProofData: parsed.data,
+        updatedAt: now,
+      }
+    );
+
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: "Failed to delete certification" });
+    const status = e?.status || 500;
+    res.status(status).json({ error: String(e?.message || e) });
   }
 });
 
@@ -2676,6 +2844,146 @@ function buildEmailHtml(cert, status) {
 </html>`;
 }
 
+function buildOverdueDigestHtml(items) {
+  const today = new Date();
+  const headerDate = today.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+
+  const rowsHtml = items
+    .map((c, idx) => {
+      const expiry = c.validityUpto
+        ? startOfDay(new Date(c.validityUpto))
+        : null;
+      const now = startOfDay(new Date());
+      const daysOverdue =
+        expiry && expiry.getTime() < now.getTime() ? daysDiff(expiry, now) : "";
+
+      const att =
+        c.hasAttachment && PUBLIC_BASE_URL
+          ? `${PUBLIC_BASE_URL.replace(
+              /\/+$/,
+              ""
+            )}/api/certifications/${encodeURIComponent(c.id)}/attachment`
+          : "";
+
+      const attCell = c.hasAttachment
+        ? att
+          ? `<a href="${escapeHtml(
+              att
+            )}" style="color:#1d4ed8;text-decoration:none;font-weight:700;">Download</a>`
+          : `<span style="color:#6b7280;">Yes (set PUBLIC_BASE_URL)</span>`
+        : `<span style="color:#6b7280;">No</span>`;
+
+      return `
+<tr style="background:${idx % 2 === 0 ? "#ffffff" : "#fafafa"};">
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;">${escapeHtml(
+    c.plant
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;">${escapeHtml(
+    c.type
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;">${escapeHtml(
+    c.rNo || "-"
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;">${escapeHtml(
+    formatDateInEmail(c.validityUpto) || "-"
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;font-weight:800;color:#b91c1c;">${escapeHtml(
+    String(daysOverdue || "-")
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;">${escapeHtml(
+    c.status || "-"
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;white-space:pre-wrap;">${escapeHtml(
+    c.alarmAlert || "-"
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;white-space:pre-wrap;">${escapeHtml(
+    c.action || "-"
+  )}</td>
+  <td style="padding:10px;border-bottom:1px solid #eef0f5;">${attCell}</td>
+</tr>`;
+    })
+    .join("");
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Overdue Certifications Digest</title>
+</head>
+<body style="margin:0;background:#f6f7fb;font-family:Segoe UI,Arial,sans-serif;">
+  <div style="max-width:980px;margin:32px auto;padding:0 16px;">
+    <div style="background:#fff;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.08);overflow:hidden;">
+      <div style="padding:22px 24px;background:#dc2626;color:#fff;">
+        <div style="font-size:12px;letter-spacing:2px;text-transform:uppercase;opacity:.95;font-weight:700;">
+          Consolidated Overdue Digest
+        </div>
+        <div style="margin-top:8px;font-size:22px;font-weight:800;">
+          ${escapeHtml(String(items.length))} overdue certification(s)
+        </div>
+        <div style="margin-top:6px;font-size:14px;opacity:.95;">
+          As of ${escapeHtml(headerDate)} (sent after 09:00 IST)
+        </div>
+      </div>
+
+      <div style="padding:18px 24px;">
+        <div style="padding:14px 14px;border-left:4px solid #dc2626;background:#fef2f2;border-radius:10px;">
+          <div style="font-size:14px;line-height:1.55;color:#7f1d1d;">
+            <b>Immediate action required.</b> Below are all certifications currently overdue.
+          </div>
+        </div>
+
+        <h3 style="margin:18px 0 10px 0;font-size:14px;letter-spacing:1px;text-transform:uppercase;color:#6b7280;">
+          Overdue List
+        </h3>
+
+        <div style="overflow:auto;border:1px solid #eef0f5;border-radius:12px;">
+          <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:920px;">
+            <thead>
+              <tr style="background:#111827;color:#fff;">
+                <th style="text-align:left;padding:10px;">Plant</th>
+                <th style="text-align:left;padding:10px;">Type</th>
+                <th style="text-align:left;padding:10px;">Reg. No</th>
+                <th style="text-align:left;padding:10px;">Validity Upto</th>
+                <th style="text-align:left;padding:10px;">Days Overdue</th>
+                <th style="text-align:left;padding:10px;">Status</th>
+                <th style="text-align:left;padding:10px;">Alarm</th>
+                <th style="text-align:left;padding:10px;">Action</th>
+                <th style="text-align:left;padding:10px;">Attachment</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+          </table>
+        </div>
+
+        ${
+          PUBLIC_BASE_URL
+            ? `<div style="margin-top:14px;font-size:13px;color:#374151;">
+                 Open tracker: <a href="${escapeHtml(
+                   PUBLIC_BASE_URL
+                 )}" style="color:#1d4ed8;text-decoration:none;font-weight:700;">${escapeHtml(
+                PUBLIC_BASE_URL
+              )}</a>
+               </div>`
+            : ""
+        }
+      </div>
+
+      <div style="padding:14px 24px;background:#fafafa;border-top:1px solid #eef0f5;color:#6b7280;font-size:12px;line-height:1.5;">
+        Automated notification from WAVE Certification Tracker. This overdue digest is sent once per day after 09:00 IST.
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 async function fetchActiveRecipients() {
   const out = await execSql(
     `
@@ -2696,9 +3004,11 @@ SELECT
   attachmentName, attachmentType,
   CASE WHEN attachmentData IS NULL THEN 0 ELSE 1 END AS hasAttachment,
   createdAt, updatedAt
-FROM dbo.Certifications;
+FROM dbo.Certifications
+WHERE isDeleted = 0;
 `
   );
+
   return out.recordset.map(mapCertificationRow);
 }
 
@@ -2782,6 +3092,44 @@ VALUES (@id, @certificationId, @recipientEmail, @emailType, @milestone, @sentAt,
   );
 }
 
+async function hasSentDigestToday(recipientEmail, digestType) {
+  const ymd = todayYmdIST();
+  const out = await execSql(
+    `
+SELECT TOP 1 id
+FROM dbo.EmailDigestLogs
+WHERE digestType = @digestType
+  AND ymd = @ymd
+  AND recipientEmail = @recipientEmail
+  AND status = 'sent';
+`,
+    { digestType, ymd, recipientEmail }
+  );
+  return Boolean(out.recordset?.[0]?.id);
+}
+
+async function addDigestLogRow({ recipientEmail, digestType, status, error }) {
+  const id = crypto.randomUUID();
+  const sentAt = new Date();
+  const ymd = todayYmdIST();
+
+  await execSql(
+    `
+INSERT INTO dbo.EmailDigestLogs (id, digestType, ymd, recipientEmail, sentAt, status, error)
+VALUES (@id, @digestType, @ymd, @recipientEmail, @sentAt, @status, @error);
+`,
+    {
+      id,
+      digestType,
+      ymd,
+      recipientEmail,
+      sentAt,
+      status,
+      error: error ? String(error).slice(0, 4000) : null,
+    }
+  );
+}
+
 async function runNotificationJob() {
   const recipients = await fetchActiveRecipients();
   if (!recipients.length) {
@@ -2792,6 +3140,63 @@ async function runNotificationJob() {
   const certs = await fetchCertificationsForNotifications();
   let sent = 0;
   let skipped = 0;
+
+  // ✅ Collect overdue items for ONE consolidated email
+  const overdueItems = [];
+  for (const parent of certs) {
+    const virtuals = expandCert(parent);
+    for (const c of virtuals) {
+      const st = getExpiryStatus(c.validityUpto);
+      if (st === "overdue") overdueItems.push(c);
+    }
+  }
+  if (overdueItems.length > 0) {
+    const digestType = "overdue-digest";
+
+    // Only send to recipients who haven't received today's digest (IST day)
+    const digestRecipients = [];
+    for (const r of recipients) {
+      const already = await hasSentDigestToday(r.email, digestType);
+      if (!already) digestRecipients.push(r);
+    }
+
+    if (digestRecipients.length > 0) {
+      const subject = `🚨 OVERDUE CERTIFICATIONS DIGEST: ${overdueItems.length} item(s)`;
+      const html = buildOverdueDigestHtml(overdueItems);
+
+      try {
+        await sendEmail(
+          digestRecipients.map((x) => x.email),
+          subject,
+          html,
+          []
+        );
+
+        for (const r of digestRecipients) {
+          await addDigestLogRow({
+            recipientEmail: r.email,
+            digestType,
+            status: "sent",
+            error: null,
+          });
+        }
+
+        sent += 1; // count this digest as one send
+      } catch (e) {
+        for (const r of digestRecipients) {
+          await addDigestLogRow({
+            recipientEmail: r.email,
+            digestType,
+            status: "failed",
+            error: String(e?.message || e),
+          });
+        }
+        console.error("[notify] overdue digest send failed:", e);
+      }
+    } else {
+      skipped += 1;
+    }
+  }
 
   // Expand a combined row into "virtual" BIS and/or IEC rows so all existing
   // email builder logic can keep using: rNo, status, validityFrom, validityUpto...
@@ -2865,7 +3270,6 @@ async function runNotificationJob() {
     return out;
   }
 
-
   for (const parent of certs) {
     const virtuals = expandCert(parent);
     if (!virtuals.length) {
@@ -2880,7 +3284,12 @@ async function runNotificationJob() {
         continue;
       }
 
-      const isOverdue = status === "overdue";
+      // ✅ Overdue is handled by ONE consolidated digest email at 9AM IST
+      if (status === "overdue") {
+        skipped += 1;
+        continue;
+      }
+
       const milestoneBase = isOverdue ? "overdue" : status;
       const milestone = `${cert._typeKey}:${milestoneBase}`;
 
@@ -2888,7 +3297,6 @@ async function runNotificationJob() {
       const toSend = [];
       for (const r of recipients) {
         if (isOverdue) {
-          // NOTE: update signature: hasSentOverdueToday(certId, email, milestone)
           const already = await hasSentOverdueToday(
             cert.id,
             r.email,
@@ -2906,11 +3314,9 @@ async function runNotificationJob() {
         continue;
       }
 
-      const subject = isOverdue
-        ? `🚨 OVERDUE: ${cert.plant} ${cert.type} Certification Has Expired`
-        : `⚠️ REMINDER: ${cert.plant} ${
-            cert.type
-          } Certification - ${milestoneLabel(status)}`;
+      const subject = `⚠️ REMINDER: ${cert.plant} ${
+        cert.type
+      } Certification - ${milestoneLabel(status)}`;
 
       const html = buildEmailHtml(cert, status);
 
@@ -2926,7 +3332,8 @@ async function runNotificationJob() {
           await addEmailLogRow({
             certificationId: cert.id,
             recipientEmail: r.email,
-            emailType: isOverdue ? "overdue" : "reminder",
+            emailType: "reminder",
+
             milestone,
             status: "sent",
             error: null,
@@ -2938,7 +3345,8 @@ async function runNotificationJob() {
           await addEmailLogRow({
             certificationId: cert.id,
             recipientEmail: r.email,
-            emailType: isOverdue ? "overdue" : "reminder",
+            emailType: "reminder",
+
             milestone,
             status: "failed",
             error: String(e?.message || e),
@@ -2986,64 +3394,39 @@ async function bootstrap() {
   await seedIfEmpty();
 
   // Lightweight daily scheduler (runs after 09:00 IST once per day)
+  // Lightweight daily scheduler (runs after 09:00 IST once per day)
   let lastRunYmd = null;
 
   setInterval(async () => {
     try {
       const now = new Date();
-      const ist = new Date(now.getTime() + 330 * 60 * 1000);
-      const hh = ist.getUTCHours();
-      const mm = ist.getUTCMinutes();
+      const istMs = now.getTime() + 330 * 60 * 1000;
+      const ist = new Date(istMs);
 
+      const hour = ist.getUTCHours(); // IST hour via shifted UTC
       const ymd = todayYmdIST();
-      const afterNine = hh > 9 || (hh === 9 && mm >= 0);
 
-      if (afterNine && lastRunYmd !== ymd) {
-        console.log("[notify] Daily run starting (IST):", ymd);
-        await runNotificationJob();
-        lastRunYmd = ymd;
-        console.log("[notify] Daily run completed (IST):", ymd);
-      }
+      if (hour < 9) return; // wait until after 09:00 IST
+      if (lastRunYmd === ymd) return;
+
+      console.log("[scheduler] running notification job for IST day:", ymd);
+      const r = await runNotificationJob();
+      console.log("[scheduler] done:", r);
+
+      lastRunYmd = ymd;
     } catch (e) {
-      console.error("[notify] scheduler error:", e);
+      console.error("[scheduler] failed:", e);
     }
-  }, 15 * 60 * 1000); // every 15 minutes
+  }, 5 * 60 * 1000); // every 5 minutes
 }
 
-bootstrap()
-  .then(() => {
-    const server = https.createServer(httpsOptions, app);
-    server.listen(PORT, HOST, () => {
-      console.log(`✅ WAVE server running: https://${HOST}:${PORT}`);
-      console.log(
-        `✅ Static dir: ${
-          fs.existsSync(STATIC_DIR) ? STATIC_DIR : "(missing)"
-        } `
-      );
-      console.log(`✅ API base: https://${HOST}:${PORT}/api`);
-      console.log(
-        `✅ Email link base: ${
-          PUBLIC_BASE_URL ? PUBLIC_BASE_URL : "(PUBLIC_BASE_URL not set)"
-        }`
-      );
-    });
-
-    const shutdown = async (sig) => {
-      try {
-        console.log(`\n🛑 Received ${sig}, shutting down...`);
-        server.close(() => console.log("HTTP server closed"));
-        if (pool) await pool.close();
-        process.exit(0);
-      } catch (e) {
-        console.error("Shutdown error:", e);
-        process.exit(1);
-      }
-    };
-
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-  })
-  .catch((e) => {
+https.createServer(httpsOptions, app).listen(PORT, HOST, async () => {
+  try {
+    await bootstrap();
+    console.log(`✅ WAVE backend running on https://${HOST}:${PORT}`);
+    if (STATIC_DIR) console.log(`✅ Serving frontend from: ${STATIC_DIR}`);
+  } catch (e) {
     console.error("❌ Bootstrap failed:", e);
     process.exit(1);
-  });
+  }
+});
