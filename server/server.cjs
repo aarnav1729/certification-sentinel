@@ -2897,6 +2897,10 @@ function buildOverdueDigestHtml(items) {
   <td style="padding:10px;border-bottom:1px solid #eef0f5;">${escapeHtml(
     c.status || "-"
   )}</td>
+    <td style="padding:10px;border-bottom:1px solid #eef0f5;white-space:pre-wrap;">${escapeHtml(
+      c.modelList || "-"
+    )}</td>
+
   <td style="padding:10px;border-bottom:1px solid #eef0f5;white-space:pre-wrap;">${escapeHtml(
     c.alarmAlert || "-"
   )}</td>
@@ -2926,7 +2930,7 @@ function buildOverdueDigestHtml(items) {
           ${escapeHtml(String(items.length))} overdue certification(s)
         </div>
         <div style="margin-top:6px;font-size:14px;opacity:.95;">
-          As of ${escapeHtml(headerDate)} (sent after 09:00 IST)
+          As of ${escapeHtml(headerDate)} (sent at 09:00 am IST)
         </div>
       </div>
 
@@ -2942,7 +2946,7 @@ function buildOverdueDigestHtml(items) {
         </h3>
 
         <div style="overflow:auto;border:1px solid #eef0f5;border-radius:12px;">
-          <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:920px;">
+          <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:1200px;">
             <thead>
               <tr style="background:#111827;color:#fff;">
                 <th style="text-align:left;padding:10px;">Plant</th>
@@ -2951,6 +2955,8 @@ function buildOverdueDigestHtml(items) {
                 <th style="text-align:left;padding:10px;">Validity Upto</th>
                 <th style="text-align:left;padding:10px;">Days Overdue</th>
                 <th style="text-align:left;padding:10px;">Status</th>
+                <th style="text-align:left;padding:10px;">Model List Entry</th>
+
                 <th style="text-align:left;padding:10px;">Alarm</th>
                 <th style="text-align:left;padding:10px;">Action</th>
                 <th style="text-align:left;padding:10px;">Attachment</th>
@@ -2976,7 +2982,7 @@ function buildOverdueDigestHtml(items) {
       </div>
 
       <div style="padding:14px 24px;background:#fafafa;border-top:1px solid #eef0f5;color:#6b7280;font-size:12px;line-height:1.5;">
-        Automated notification from WAVE Certification Tracker. This overdue digest is sent once per day after 09:00 IST.
+        Automated notification from Premier Energies Certification Tracker. This overdue digest is sent once per day after 09:00 IST.
       </div>
     </div>
   </div>
@@ -3290,6 +3296,7 @@ async function runNotificationJob() {
         continue;
       }
 
+      const isOverdue = status === "overdue";
       const milestoneBase = isOverdue ? "overdue" : status;
       const milestone = `${cert._typeKey}:${milestoneBase}`;
 
@@ -3360,6 +3367,69 @@ async function runNotificationJob() {
   return { ok: true, sent, skipped };
 }
 
+/* ========================= Daily Scheduler (09:00 AM IST) ========================= */
+
+const IST_OFFSET_MS = 330 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function msUntilNext9amIST() {
+  const now = Date.now();
+  const nowIST = new Date(now + IST_OFFSET_MS);
+
+  // target IST "today at 09:00"
+  let targetIST = new Date(
+    Date.UTC(
+      nowIST.getUTCFullYear(),
+      nowIST.getUTCMonth(),
+      nowIST.getUTCDate(),
+      9, // 09:00 AM IST
+      0,
+      0,
+      0
+    )
+  );
+
+  // if past 09:00 IST already, schedule for next day
+  if (targetIST.getTime() <= nowIST.getTime()) {
+    targetIST = new Date(targetIST.getTime() + DAY_MS);
+  }
+
+  // convert IST target to UTC timestamp
+  const targetUTC = targetIST.getTime() - IST_OFFSET_MS;
+  return Math.max(1000, targetUTC - now);
+}
+
+function startDailyNotificationSchedule() {
+  const firstDelay = msUntilNext9amIST();
+  console.log(
+    `[scheduler] Daily notifications scheduled. First run in ${Math.round(
+      firstDelay / 1000
+    )}s (09:00 AM IST)`
+  );
+
+  setTimeout(async () => {
+    try {
+      console.log(
+        "[scheduler] Running daily notification job (09:00 AM IST)..."
+      );
+      await runNotificationJob();
+    } catch (e) {
+      console.error("[scheduler] Notification job failed:", e);
+    }
+
+    setInterval(async () => {
+      try {
+        console.log(
+          "[scheduler] Running daily notification job (09:00 AM IST)..."
+        );
+        await runNotificationJob();
+      } catch (e) {
+        console.error("[scheduler] Notification job failed:", e);
+      }
+    }, DAY_MS);
+  }, firstDelay);
+}
+
 app.post("/api/notifications/run", async (_req, res) => {
   try {
     const result = await runNotificationJob();
@@ -3423,7 +3493,9 @@ async function bootstrap() {
 https.createServer(httpsOptions, app).listen(PORT, HOST, async () => {
   try {
     await bootstrap();
-    console.log(`✅ WAVE backend running on https://${HOST}:${PORT}`);
+    console.log(`✅ cert-tracker backend running on https://${HOST}:${PORT}`);
+    startDailyNotificationSchedule();
+
     if (STATIC_DIR) console.log(`✅ Serving frontend from: ${STATIC_DIR}`);
   } catch (e) {
     console.error("❌ Bootstrap failed:", e);
